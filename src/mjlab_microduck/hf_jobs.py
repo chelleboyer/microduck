@@ -33,7 +33,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from netrc import netrc
+from netrc import NetrcParseError, netrc
 from pathlib import Path
 
 from huggingface_hub import HfApi, Volume, get_token
@@ -124,17 +124,22 @@ exit $TRAIN_RC
 def _wandb_api_key() -> str | None:
     """Best-effort lookup of the user's wandb API key.
 
-    Order: WANDB_API_KEY env -> ~/.netrc (machine api.wandb.ai).
+    Order: WANDB_API_KEY env -> ~/.netrc, then ~/_netrc (machine api.wandb.ai).
+
+    On Windows `wandb login` writes ~/_netrc (the Windows netrc convention),
+    never ~/.netrc — so checking only the dotted name made submission abort
+    with "no API key found" on a machine that was correctly logged in.
     """
     if k := os.environ.get("WANDB_API_KEY"):
         return k
-    try:
-        n = netrc(str(Path.home() / ".netrc"))
-        auth = n.authenticators("api.wandb.ai")
-        if auth and auth[2]:
-            return auth[2]
-    except (FileNotFoundError, OSError):
-        pass
+    for name in (".netrc", "_netrc"):
+        try:
+            n = netrc(str(Path.home() / name))
+            auth = n.authenticators("api.wandb.ai")
+            if auth and auth[2]:
+                return auth[2]
+        except (FileNotFoundError, OSError, NetrcParseError):
+            continue
     return None
 
 

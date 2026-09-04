@@ -7186,3 +7186,94 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# ==============================================================================
+# Hopscotch — simultaneous flight (both feet off the ground at once)
+# ==============================================================================
+#
+# The one genuinely new reward in the hopscotch fork. mjlab's stock
+# feet_air_time pays ALTERNATING single-foot air time — that is ordinary
+# walking, and a healthy walking policy already scores 1.01 on it with per-foot
+# air times of 125-300 ms. Reading those fields to detect a hop reports a pass
+# for a robot that never leaves the ground. See docs/s1-flight-probe.md.
+#
+# A hop is BOTH feet off at once, i.e. n_contact == 0, and the probe found two
+# ways that metric lies if taken alone:
+#   1. A duck falling over loses both foot contacts and logs excellent "air
+#      time" — 384 apparent successes in the probe were topples. Hence the tilt
+#      gate.
+#   2. A duck sitting on its trunk can lift both feet while going nowhere.
+#      Hence the height gate.
+#
+# Physics baseline to beat: ~34 ms of open-loop simultaneous flight, torque-
+# saturated, WITHOUT BAM back-EMF (so optimistic). A policy has to clear that
+# bar before "Microduck can hop" means anything.
+
+
+def simultaneous_flight(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    min_flight_s: float = 0.02,
+    max_flight_s: float = 0.30,
+    min_height: float = 0.10,
+    max_tilt_deg: float = 30.0,
+    settle_steps: int = 2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay 1.0 per step while GENUINELY airborne on both feet. Positive weight.
+
+    Airborne is read from the contact sensor as ``min(current_air_time)`` over
+    the feet: per-foot air time is time since THAT foot left the ground, so the
+    minimum across feet is exactly the time since the LAST foot left — i.e. the
+    duration of the current simultaneous-flight phase, and > 0 iff
+    ``n_contact == 0``. This is stateless, which matters because a reward that
+    accumulates its own flight counter would have to be reset-aware.
+
+    Three gates, each blocking a measured failure mode rather than a
+    hypothetical one:
+
+    - ``min_flight_s`` — ignore contact flicker. Below this, a contact-solver
+      blip during an ordinary stride reads as flight.
+    - ``max_flight_s`` — stop paying for a phase longer than any real hop on a
+      25 cm robot. Uncapped, a ballistic launch that stays upright outscores
+      every honest hop, and CLAUDE.md's no-jackpot rule says any "reach X"
+      payoff must be bounded. Credit stops; the term does not go negative.
+    - ``min_height`` / ``max_tilt_deg`` — the topple and butt-hop screens from
+      the S1 probe.
+
+    Payment is FLAT per step, so total reward is linear in flight duration.
+    Paying the elapsed flight time each step instead would be quadratic — a
+    superlinear payoff for one long launch, which is the jackpot shape.
+
+    Defaults are measured, not assumed: the walk model settles at trunk
+    z = 116.7 mm holding STAND, so ``min_height`` = 100 mm allows a compressed
+    takeoff while excluding anything resting on the trunk. Re-measure after any
+    model revision — a 5 mm-wrong height has cost this project days before.
+    """
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time  # (num_envs, num_feet)
+    assert air_time is not None, f"sensor {sensor_name!r} reports no air time"
+
+    # Time since the LAST foot left the ground; 0 while any foot is down.
+    flight_t = torch.nan_to_num(air_time, nan=0.0).min(dim=1).values
+
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    quat = asset.data.root_link_quat_w
+    # cos(tilt) = R22 = 1 - 2(qx² + qy²)
+    cos_tilt = torch.nan_to_num(
+        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
+    )
+
+    airborne = (flight_t > min_flight_s) & (flight_t <= max_flight_s)
+    upright = cos_tilt > math.cos(math.radians(max_tilt_deg))
+    risen = z > min_height
+    # A robot spawned clear of the floor is upright, at height, and touching
+    # nothing — it would bank free flight on step 0 of every episode.
+    settled = env.episode_length_buf > settle_steps
+
+    return (airborne & upright & risen & settled).float()
