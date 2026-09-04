@@ -30,9 +30,13 @@ entangled with theirs by the fork strategy.
 
 ## Clone, not GitHub fork
 
-We merged upstream's history into this existing repo rather than using GitHub's fork button, so
-`origin` can be private and our planning-doc commits stay at the root of history. Practically
-identical: `upstream` is a normal remote and updates are a normal merge with a real merge base.
+We merged upstream's history into this existing repo rather than using GitHub's fork button, so our
+planning-doc commits stay at the root of history and the repo stands on its own rather than being
+presented as a fork. Practically identical: `upstream` is a normal remote and updates are a normal
+merge with a real merge base.
+
+`origin` is **public** at [`chelleboyer/microduck`](https://github.com/chelleboyer/microduck).
+Apache 2.0 is satisfied by the retained `LICENSE` and the preserved upstream history.
 
 Reversible — if upstreaming hopscotch to Pollen Robotics becomes worthwhile (an open question in the
 architecture doc), fork then and push the branch. Apache 2.0 attribution is preserved by the merged
