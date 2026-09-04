@@ -7219,6 +7219,9 @@ def simultaneous_flight(
     min_height: float = 0.10,
     max_tilt_deg: float = 30.0,
     settle_steps: int = 2,
+    command_name: str | None = None,
+    command_index: int = 2,
+    command_ref: float = 0.05,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Pay 1.0 per step while GENUINELY airborne on both feet. Positive weight.
@@ -7276,4 +7279,13 @@ def simultaneous_flight(
     # nothing — it would bank free flight on step 0 of every episode.
     settled = env.episode_length_buf > settle_steps
 
-    return (airborne & upright & risen & settled).float()
+    out = (airborne & upright & risen & settled).float()
+
+    # Optional: scale by commanded hop intent, so an all-zero command (the
+    # deployment idle state) means "stand" rather than "hop anyway". Left off
+    # by default because the S1 spike asks whether flight is reachable AT ALL,
+    # and gating the only positive signal on a command dilutes that experience.
+    if command_name is not None:
+        cmd = env.command_manager.get_command(command_name)[:, command_index]
+        out = out * torch.nan_to_num(cmd, nan=0.0).clamp(min=0.0).div(command_ref).clamp(max=1.0)
+    return out

@@ -29,6 +29,17 @@ velocity env (`head_pose_tracking`, weight 2.0, std 0.5). Mechanical caps: ±1.1
 
 **`[x, y, z, roll, pitch, yaw]`, a delta from nominal standing, with `nominal_height = 0.095` m.**
 
+> **`nominal_height` does not match the model.** Measured 2026-09-04 on `scene_walk.xml`: the STAND
+> keyframe authors trunk z = **120.0 mm**, settling to **116.7 mm** under load. The velocity env passes
+> `nominal_height = 0.095` (`mdp.py:5323`, wired at `microduck_velocity_env_cfg.py:722`) and
+> `body_pose_tracking_locomotion` defaults to `0.105` (`mdp.py:5408`) — so the velocity reference is
+> ~22 mm low. Both measure the same quantity: `root_link_pos_w[:, 2] − env_origins[:, 2]`.
+>
+> Harmless *today* only because `body_pose_tracking` runs at weight 0 in the velocity env, so nothing
+> optimizes against it — which is exactly how the constant survived. Anyone raising that weight
+> (the standup env already does, via its own `STAND_Z`) inherits the error: a commanded `z = 0`
+> would ask the robot to stand 22 mm shorter than it does. Re-measure before trusting it.
+
 In the velocity env this whole block is **carried at reward weight 0**, with deliberately tiny ranges
 (±5 mm on x/y/z, ±0.05 rad on roll/pitch/yaw) purely to keep the obs slot and its input neurons alive.
 The standup env raises the weight and widens the ranges.
