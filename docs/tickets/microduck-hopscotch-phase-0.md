@@ -67,7 +67,7 @@ instead of hours into GPU training.*
 
 **Per-ticket context**
 - Architecture: "Compute & dev loop" (this ticket *is* that decision, made real), and spike **S3**.
-- Upstream `AGENTS.md`: the 64-env/5-iteration smoke test "catches ~95% of config errors"; existing
+- Upstream `CLAUDE.md`: the 64-env/5-iteration smoke test "catches ~95% of config errors"; existing
   CPU-runnable `tests/test_*_cfg.py` are the model for the first stage.
 - This exists because we chose an all-remote dev loop with no local GPU. It is the mitigation that makes
   that choice affordable — without it, every typo costs a full remote round-trip.
@@ -94,7 +94,7 @@ hops well; it means we know whether it can, with data good enough to bet the nex
   domain randomization, obs noise, command delays and NaN guards stay in sync automatically.
 - A **simultaneous-flight reward term** — both feet off the ground at once. Note mjlab's stock
   `feet_air_time` rewards *alternating* single-foot air time (ordinary walking) and is not a substitute.
-- Minimal regularizers, per `AGENTS.md`: motion-blockers (body angular velocity, angular momentum, pose
+- Minimal regularizers, per `CLAUDE.md`: motion-blockers (body angular velocity, angular momentum, pose
   std) kept **low** because they penalize exactly what dynamic motion requires; smoothness penalties
   (action rate, torque rate) **omitted at this stage** — introduced during exploration, "do nothing" wins.
 - Chosen command slot non-zero from step 0 even at weight 0, or its input weights die permanently.
@@ -110,7 +110,7 @@ Decision rule: >80ms consistent air time with upright landing  -> true hop track
                                                                   (foot placement into cells, no flight).
 ```
 
-- Air time measured against **tilt**, not just height — `AGENTS.md` is explicit that height-only upright
+- Air time measured against **tilt**, not just height — `CLAUDE.md` is explicit that height-only upright
   checks miss failure modes.
 - Expect not to converge cleanly on the first try. Upstream: 2–5 reward-hacking iterations before
   convergence is normal. Judge failures from evidence (end-state clusters, air-time profiles) before
@@ -119,7 +119,7 @@ Decision rule: >80ms consistent air time with upright landing  -> true hop track
 **Per-ticket context**
 - Architecture: "The core new reward: simultaneous flight", "Observation & command contract",
   "Missing pieces", spike **S1**.
-- Upstream `AGENTS.md`: reward design lessons (jackpot prevention, regularizer types, tracking Gaussian
+- Upstream `CLAUDE.md`: reward design lessons (jackpot prevention, regularizer types, tracking Gaussian
   std), the "Adding a New Task" workflow, and the physics-verification step *before* training.
 - Template: `microduck_velocity_env_cfg.py` is the main recipe.
 

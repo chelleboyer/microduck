@@ -27,7 +27,9 @@ The brief assumes more greenfield than there is. [`pollen-robotics/microduck_rl`
 - **A sim2real stack** — BAM M6 actuator model for the Dynamixel XL330 (voltage law, back-EMF,
   load-dependent friction), domain randomization over battery voltage, sag, command delay and friction,
   IMU misalignment, encoder bias, backlash twins, NaN guards.
-- **`AGENTS.md`** — a distilled reward-design and sim2real playbook encoding months of hard-won lessons.
+- **`CLAUDE.md`** (repo root, post-merge) — a distilled reward-design and sim2real playbook encoding
+  months of hard-won lessons. Every reference to "`CLAUDE.md`" below means this upstream file; our own
+  fork rules live in `docs/hopscotch-rules.md`.
 - **An export/publish path** — ONNX with the observation normalizer baked in, schema-2 manifest, Hub upload.
 
 Two consequences:
@@ -99,11 +101,11 @@ single hardest part of this problem and already solved upstream.
 
 **Repo strategy** — Fork `microduck_rl` into this repo, upstream kept as a git remote to pull from.
 The `--hf-jobs`, export, publish and DR tooling all assume the repo layout, so an overlay package would
-have to port the full DR + obs-noise + NaN-guard stack (their AGENTS.md warns about exactly this).
+have to port the full DR + obs-noise + NaN-guard stack (their CLAUDE.md warns about exactly this).
 Cost accepted: our work is entangled with theirs and merges need care. Upstream is young and moving
 fast, so we pin a known-good commit and pull deliberately, not continuously.
 
-**Task template** — Build on the velocity family (`make_microduck_velocity*_env_cfg`). AGENTS.md
+**Task template** — Build on the velocity family (`make_microduck_velocity*_env_cfg`). CLAUDE.md
 recommends this explicitly: it keeps domain randomization, observation noise, command delays and NaN
 guards in sync automatically. Roulade was the tempting alternative (the only existing explosive,
 ballistic template, with motion-blocker regularizers already tuned low) but it is episodic and has no
@@ -112,14 +114,14 @@ locomotion command structure.
 **Observation & command contract** — Stay at 61D. No new observation slots. The hop command is encoded
 by repurposing existing command-block capacity (candidate: a `body_pose` vertical component as commanded
 hop height). Exact slot semantics must be read from source after the fork — see Open questions. Per
-AGENTS.md, whichever slot is chosen must be non-zero from step 0 even at reward weight 0, or its input
+CLAUDE.md, whichever slot is chosen must be non-zero from step 0 even at reward weight 0, or its input
 weights die permanently; and the all-zero command (deployment idle) must be trained explicitly via
 exact-zero sampling rather than left to uniform sampling.
 
 **The core new reward: simultaneous flight** — mjlab's velocity lineage ships `feet_air_time`, but that
 rewards *alternating* single-foot air time — ordinary walking. A hop requires **both feet off the ground
 at once**. This is a genuinely new reward term, not a reweighting, and it is the central piece of new
-work in the project. AGENTS.md constrains its design: no "reach X" jackpots (use potential-based shaping,
+work in the project. CLAUDE.md constrains its design: no "reach X" jackpots (use potential-based shaping,
 charging for progress deltas); keep motion-blocker regularizers (body angular velocity, angular momentum,
 pose std) *low*, because they penalize exactly what dynamic motion requires; introduce smoothness
 penalties (action rate, torque rate) only *after* the skill exists, via curriculum, or "do nothing" wins
@@ -128,12 +130,12 @@ catches sign inversions.
 
 **Compute & dev loop** — All-remote on HF Jobs; no local GPU and no WSL2 setup. Mitigated by a
 **preflight-in-one-job** pattern: a single job runs CPU-runnable config tests → 64-env/5-iteration smoke
-test → full training, failing fast before the GPU section starts. AGENTS.md reports the smoke test catches
+test → full training, failing fast before the GPU section starts. CLAUDE.md reports the smoke test catches
 ~95% of config errors, and `cpu-basic` is $0.01/hr, so a reward-sign typo dies in seconds rather than
 after hours of training. One cold start per iteration.
 
 **Budget posture** — Lean. Default `l4x1` at $0.80/hr. Flight-phase spike ~1000 iterations (~$3–5). A
-full hop gait is a curriculum-heavy gait, so AGENTS.md's 4000–6000 iteration budget applies (~$15–30 per
+full hop gait is a curriculum-heavy gait, so CLAUDE.md's 4000–6000 iteration budget applies (~$15–30 per
 run), and 2–5 reward-hacking iterations before convergence is normal and expected. Early phase should
 land well under $150.
 
@@ -152,11 +154,11 @@ bug because it applies the normalizer anyway.
 
 - **A simultaneous-flight reward term** — the central new work (see above).
 - **A hop command encoding** — which slot carries hop intent, and its sampling distribution, including
-  explicit buckets for rare-but-important command regions (AGENTS.md: turn-in-place spins emerged as ~2%
+  explicit buckets for rare-but-important command regions (CLAUDE.md: turn-in-place spins emerged as ~2%
   of experience under uniform sampling and never trained).
 - **A hop-gait environment config module** plus its registration and `-Backlash-` twin.
 - **Landing-quality criteria** — what counts as "upright" and "accurate", as measurable terminations and
-  reward gates rather than prose. AGENTS.md warns to check *tilt*, not just height.
+  reward gates rather than prose. CLAUDE.md warns to check *tilt*, not just height.
 - **A curriculum** from hop-in-place → forward hop → consecutive hops → sequence, with stage boundaries.
 - **A headless evaluation battery** — per-spawn-type outcomes, end-state clusters, air-time profiles —
   to judge runs before touching rewards.
@@ -214,7 +216,7 @@ via `scripts/infer_policy.py` before deploying to the physical robot.
 
 ## Sources
 
-- [pollen-robotics/microduck_rl](https://github.com/pollen-robotics/microduck_rl) — README and AGENTS.md
+- [pollen-robotics/microduck_rl](https://github.com/pollen-robotics/microduck_rl) — README and CLAUDE.md
 - [pollen-robotics/microduck](https://github.com/pollen-robotics/microduck) — on-robot Rust runtime
 - [mujocolab/mjlab](https://github.com/mujocolab/mjlab) — training framework
 - [HF Jobs configuration](https://huggingface.co/docs/hub/jobs-configuration) — flavors, pricing, timeouts, volumes
