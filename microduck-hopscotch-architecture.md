@@ -181,6 +181,17 @@ backlash or DR). A policy can still beat it: the head is 280 g of a 737 g robot 
 rigid. **Measure `n_contact == 0` gated on tilt and rise — per-foot `current_air_time` reports
 125-300 ms for an ordinary walk.**
 
+**Update 2026-09-04 (later) — PRIOR ART FOUND; S1 substantially answered, and re-scoped.**
+A community policy ([`docs/prior-art-hop.md`](./docs/prior-art-hop.md),
+`joanfox/microduck-happy-hop`) reports a complete two-foot hop — crouch, takeoff, landing absorption,
+stable recovery — trained under **backlash + BAM + current saturation + DR**, using bilateral foot
+clearance (0.035 m target) as its objective. Sim-only, never hardware-tested, self-reported. But it
+means the blocking question below is largely settled in the affirmative, and the ~$5 run should not be
+spent re-asking it. The live question is now whether a hop can be **commanded and repeatable** through
+the 13D block, since theirs is episodic with every command slot zeroed — i.e. it is evidence for
+approach **C**, which we rejected in favour of **A**. That choice is now contested by evidence rather
+than settled by argument.
+
 ```
 Question:      Can Microduck achieve a real flight phase (both feet off ground, measurable air time)?
 Spike:         Velocity-derived env, reward air-time + upright landing only, minimal regularizers.
@@ -190,7 +201,10 @@ Decision rule: >80ms consistent air time with upright landing  -> true hop track
                                                                   (foot placement into cells, no flight).
 ```
 
-**S2 — Does the stock pipeline run end-to-end on our HF account?**
+**S2 — Does the stock pipeline run end-to-end on our HF account?** *(RESOLVED 2026-09-04: yes.
+Namespace `chelleboyer`, Pro active. Stock velocity task submitted via `--hf-jobs`, ran to completion,
+`.pt` checkpoints landed in a private Hub model repo, wandb streamed live. The pipeline is trusted.
+Only the 12h timeout behaviour remains unobserved — see [`docs/upstream-pin.md`](./docs/upstream-pin.md).)*
 Cheap, and the brief already calls for it. Run stock `Mjlab-Velocity-Flat-MicroDuck` via `--hf-jobs`,
 confirm namespace/billing, checkpoint upload, wandb streaming, and the 12h timeout behaviour. Decision
 rule: if checkpoints land in the Hub repo and wandb streams, the pipeline is trusted and we never

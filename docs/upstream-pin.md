@@ -75,9 +75,22 @@ tarball the container cannot use.
 - [x] Upstream retained as a git remote, pinned, pin recorded with rationale
 - [x] `uv sync` succeeds and is honest — verified on Windows 2026-09-04, exit 0
 - [x] Upstream's CPU test suite passes locally: **149 passed in 55 s, no GPU**
-- [ ] HF auth working; namespace chosen deliberately (governs repos, uv-cache bucket, **and billing**)
-- [ ] Stock `Mjlab-Velocity-Flat-MicroDuck` submitted via `--hf-jobs`, run to a usable checkpoint
-- [ ] `.pt` checkpoints confirmed landing in the private Hub model repo during training
-- [ ] wandb confirmed streaming live
-- [ ] 12h timeout behaviour understood and written down
-- [ ] Walking policy plays back correctly — the known-good reference for later A/Bs
+- [x] HF auth working; namespace chosen deliberately — **`chelleboyer`** (personal). Pro is active, so
+      Jobs is available; the one org `context-course` is NOT Enterprise, and Jobs for orgs requires
+      Enterprise, so running under it would fail *and* bill the org. wandb entity is
+      `chelleboyer-road-ranger`.
+- [~] Stock `Mjlab-Velocity-Flat-MicroDuck` submitted via `--hf-jobs` — **submitted and completed**
+      (job `6a9b0c79`, 64 envs / 5 iters). That is a smoke test, not a usable checkpoint; the full
+      4096-env run has not been done.
+- [x] `.pt` checkpoints confirmed landing in the private Hub model repo during training —
+      `chelleboyer/mjlab-velocity-flat-microduck-20260904-132240`, `model_0.pt` + `model_4.pt`
+      (4.7 MB each) plus `params/{agent,env}.yaml`, repo private.
+- [x] wandb confirmed streaming live — run `7rl454wv` under `chelleboyer-road-ranger/mjlab_microduck`.
+- [ ] 12h timeout behaviour understood and written down — **not exercised.** No run has approached it.
+- [ ] Walking policy plays back correctly — the known-good reference for later A/Bs. Blocked on the
+      full-length run above.
+
+**Scheduling latency is variable and worth planning around:** three jobs queued 46 min, ~0 min, and
+~12 min before starting. Compute for a 64-env/5-iter smoke test is ~5 min, so wall-clock is dominated
+by scheduling, not training. This strengthens the hybrid loop (spike **S3**): prove everything
+provable on CPU locally, submit only what genuinely needs a GPU.

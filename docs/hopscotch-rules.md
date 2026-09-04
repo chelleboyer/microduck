@@ -3,14 +3,32 @@
 Teach Pollen Robotics' Microduck to hop, then to hopscotch — trained in MuJoCo simulation on Hugging
 Face Jobs, ultimately deployed to the physical robot.
 
-## Current state (2026-09-04)
+## Current state (2026-09-04, end of session 2)
 
-**Upstream merged and pinned; local CPU loop working.** Upstream `microduck_rl` is merged at
-`1e79c29` (see [`upstream-pin.md`](./upstream-pin.md)). `uv sync` and the 149-test CPU suite pass on
-Windows. First hopscotch code is [`scripts/hopscotch/flight_probe.py`](../scripts/hopscotch/flight_probe.py).
+**The remote pipeline works end-to-end, and the hop env exists and is GPU-validated.**
 
-**Next action: finish MD-1** — HF auth and namespace, then run stock
-`Mjlab-Velocity-Flat-MicroDuck` via `--hf-jobs` end-to-end.
+- Upstream merged and pinned at `1e79c29` ([`upstream-pin.md`](./upstream-pin.md)). 199 CPU tests pass
+  on Windows in ~13 s, no GPU.
+- **HF Jobs proven.** Namespace `chelleboyer` (personal; Pro active, so Jobs is available — the org
+  `context-course` is NOT Enterprise and would fail). wandb entity `chelleboyer-road-ranger`.
+  Stock velocity smoke test ran to completion, checkpoints landed in a private Hub model repo, wandb
+  streamed live.
+- **`Mjlab-Hop-Flat-MicroDuck`** registered (+ `-Backlash-` twin) with two new rewards:
+  `simultaneous_flight` (binary, weight 5.0) and `bilateral_foot_clearance` (dense ramp, weight 2.0).
+  Smoke-tested on GPU twice: builds, steps NaN-free, all 18 terms compute, every penalty logs ≤ 0,
+  and both new terms read non-zero under a random policy (so neither is silently dead).
+- **Prior art found:** someone has already trained a Microduck hop —
+  [`prior-art-hop.md`](./prior-art-hop.md). **Read it before spending GPU on S1.**
+
+**Next action: re-scope S1 before running it.** The original question ("can this robot leave the
+ground") is substantially answered by the prior art, so a ~$5 run to re-ask it buys little. The open
+question is whether a hop can be **commanded and repeatable** through the 13D block rather than a
+one-shot episodic trick. Decide that, then run.
+
+Two small Windows fixes in `hf_jobs.py` are known and unmade: the log streamer dies on non-ASCII
+output unless `PYTHONIOENCODING=utf-8` is set (the job itself is unaffected, but the local command
+reports failure), and the `[wandb] forwarding API key from ~/.netrc` message names the wrong file when
+the key came from `_netrc`.
 
 ## Read these, in this order
 
@@ -22,6 +40,10 @@ Windows. First hopscotch code is [`scripts/hopscotch/flight_probe.py`](../script
    rationale, rejected alternatives, spikes and open questions. **The load-bearing doc.**
 4. [`tickets/microduck-hopscotch-phase-0.md`](./tickets/microduck-hopscotch-phase-0.md) —
    Phase 0 work: MD-1, MD-2, MD-3.
+5. [`prior-art-hop.md`](./prior-art-hop.md) — a community Microduck hop policy, what it proves and
+   what it leaves open. Changes the shape of S1.
+6. [`command-block.md`](./command-block.md) — the 13D command block, where hop intent goes, and the
+   `nominal_height` discrepancy.
 
 ## Constraints that are expensive to rediscover
 

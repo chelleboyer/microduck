@@ -24,18 +24,31 @@ implementation ticket and carries most of the weight. Padding the first two woul
 
 ---
 
-## Status (2026-09-04)
+## Status (2026-09-04, end of session 2)
 
-- **MD-1** — in progress. Fork merged and pinned, `uv sync` green, 149 CPU tests green. Remaining:
-  HF auth + namespace, then the `--hf-jobs` run. Checklist: [`../upstream-pin.md`](../upstream-pin.md).
-- **MD-2** — **demoted**. S3 resolved: the CPU stage runs locally in 55 s, so preflight is an
-  optimization, not the thing that makes the loop affordable. Only its in-job smoke test still earns
-  its place. Do MD-3 first.
-- **MD-3** — first acceptance criterion (command-block semantics) is **already done**:
-  [`../command-block.md`](../command-block.md). Two constraints added from the CPU probe
-  ([`../s1-flight-probe.md`](../s1-flight-probe.md)): measure `n_contact == 0` gated on tilt AND
-  trunk rise (contact-loss alone reads a topple as flight), and **do not put motion-blocker penalties
-  on the neck** — head swing looks load-bearing for the hop.
+- **MD-1** — **nearly done.** Fork merged and pinned; 199 CPU tests green; HF auth working, namespace
+  `chelleboyer` chosen deliberately; `--hf-jobs` proven end-to-end (checkpoints landing in a private
+  Hub repo, wandb streaming live). Remaining: a full-length run to a usable walking checkpoint (the
+  known-good A/B reference), and the 12h timeout behaviour, which nothing has exercised.
+  Checklist with evidence: [`../upstream-pin.md`](../upstream-pin.md).
+- **MD-2** — **demoted**, still unbuilt, and now lower value than when it was written: measured job
+  scheduling (46 / 0 / 12 min across three submissions) dominates wall-clock more than config errors
+  do, and the CPU suite catches those locally in seconds anyway.
+- **MD-3** — **mostly built; the spike itself has not been run.** Done:
+  - Command-block semantics documented ([`../command-block.md`](../command-block.md)); hop intent in
+    `body_pose[2]`, `body_pose_tracking` held at weight 0 (a test asserts it).
+  - `Mjlab-Hop-Flat-MicroDuck` + `-Backlash-` twin registered, velocity-derived
+    (`tasks/microduck_hop_env_cfg.py`) — read its module docstring, which enumerates all seven
+    deviations from the walker and why each exists.
+  - Two rewards in `tasks/mdp.py`: `simultaneous_flight` (binary, `n_contact == 0`, gated on tilt and
+    trunk rise) and `bilateral_foot_clearance` (dense ramp). Each rejects the other's exploit.
+  - CPU cfg tests + two GPU smoke tests: 18 terms compute, every penalty ≤ 0, both new terms non-zero
+    under a random policy (so neither is silently unreachable).
+
+  **Not done: the S1 run and its decision — and the question it should answer has changed.** See
+  [`../prior-art-hop.md`](../prior-art-hop.md): a community policy already achieved a two-foot hop
+  under backlash and BAM, so re-asking "can it leave the ground" buys little. Re-scope toward
+  "can a hop be commanded and repeatable" before spending.
 
 ## Tickets
 
