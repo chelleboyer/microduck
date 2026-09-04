@@ -20,6 +20,15 @@ make WALKING optimal, and several of its terms make walking beat hopping.
    1.01 on it with 125-300 ms per-foot air times while never leaving the floor.
    It cannot detect a hop and is not a substitute (docs/s1-flight-probe.md).
 
+1b. **bilateral_foot_clearance is its dense ramp** (weight 2.0). The flight
+   term is binary and pays nothing until the robot is ALREADY airborne, which
+   is no gradient at all through the long stretch where it is learning to load
+   and extend. Clearance pays partial credit for a partial lift. The pairing is
+   deliberate: clearance can be farmed by tucking the feet while the trunk
+   sags, which the flight term's contact condition rejects; flight can be
+   reached by toppling, which clearance rejects because a falling duck's feet
+   do not rise. Each covers the other's exploit, and both carry the trunk gates.
+
 2. **air_time drops 3.0 → 0.5.** At 3.0 a good stride out-earns any hop the
    robot can currently produce, so walking is simply the better policy. Not
    zeroed: lifting a foot at all is a prerequisite skill, and a small stride
@@ -110,6 +119,13 @@ FLIGHT_MAX_TILT_DEG = 30.0
 FLIGHT_MIN_S = 0.02
 FLIGHT_MAX_S = 0.30
 
+# Bilateral foot clearance — the dense ramp toward flight. Target matches the
+# one known working Microduck hop (joanfox/microduck-happy-hop: target 0.035 m,
+# success 0.030 m). Measured on the walk model: foot sites rest at 2.9 mm at
+# STAND, so clearance is scored ABOVE that and 0.035 means real lift.
+CLEARANCE_TARGET = 0.035
+FOOT_REST_HEIGHT = 0.0029
+
 # Smoothness is introduced only after the skill exists (see docstring note 5).
 ACTION_RATE_KICKIN_ITER = 400
 
@@ -156,6 +172,22 @@ def make_microduck_hop_env_cfg(
             # intent the policy cannot yet act on dilutes that experience.
             # Phase 1 sets command_name="body_pose" to make hopping commandable.
             "command_name": None,
+        },
+    )
+
+    # Dense bootstrap for the flight term, which is binary and pays nothing
+    # until the robot is already airborne. Subordinate weight: clearance is the
+    # ramp, flight is the goal. See bilateral_foot_clearance in mdp.py for the
+    # convergent evidence (an independently trained Microduck hop optimised
+    # exactly this metric, target 0.035 m).
+    cfg.rewards["bilateral_foot_clearance"] = RewardTermCfg(
+        func=microduck_mdp.bilateral_foot_clearance,
+        weight=2.0,
+        params={
+            "target_height": CLEARANCE_TARGET,
+            "rest_height": FOOT_REST_HEIGHT,
+            "min_trunk_height": FLIGHT_MIN_HEIGHT,
+            "max_tilt_deg": FLIGHT_MAX_TILT_DEG,
         },
     )
 

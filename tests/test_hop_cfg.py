@@ -32,6 +32,36 @@ def test_flight_is_the_dominant_reward():
     assert flight.weight > max(positives.values()), positives
 
 
+def test_clearance_ramps_flight_without_outranking_it():
+    # Clearance is the dense ramp, flight is the goal. If clearance out-weighed
+    # flight the policy could settle for a deep two-foot tuck that never leaves
+    # the ground — it scores full clearance and zero flight.
+    cfg = make_microduck_hop_env_cfg()
+    assert "bilateral_foot_clearance" in cfg.rewards
+    clearance = cfg.rewards["bilateral_foot_clearance"]
+    assert clearance.func is microduck_mdp.bilateral_foot_clearance
+    assert 0.0 < clearance.weight < cfg.rewards["simultaneous_flight"].weight
+
+
+def test_clearance_and_flight_share_the_same_trunk_gates():
+    # The two terms cover each other's exploit only if they agree on what
+    # counts as upright and off-the-ground.
+    r = make_microduck_hop_env_cfg().rewards
+    c, f = r["bilateral_foot_clearance"].params, r["simultaneous_flight"].params
+    assert c["min_trunk_height"] == f["min_height"]
+    assert c["max_tilt_deg"] == f["max_tilt_deg"]
+
+
+def test_clearance_target_is_real_lift_above_the_measured_rest_height():
+    # Foot sites rest at 2.9 mm at STAND; scoring absolute height would quietly
+    # hand over part of the target for free.
+    params = make_microduck_hop_env_cfg().rewards["bilateral_foot_clearance"].params
+    assert params["rest_height"] < 0.005
+    assert params["target_height"] > params["rest_height"]
+    # Matches the one known working Microduck hop (success threshold 0.030 m).
+    assert params["target_height"] >= 0.030
+
+
 def test_body_pose_tracking_stays_at_zero():
     # THE tempting wrong change: command z = +0.05 and reward tracking it, and
     # the optimal policy extends its legs and stands tall — strictly easier

@@ -7289,3 +7289,70 @@ def simultaneous_flight(
         cmd = env.command_manager.get_command(command_name)[:, command_index]
         out = out * torch.nan_to_num(cmd, nan=0.0).clamp(min=0.0).div(command_ref).clamp(max=1.0)
     return out
+
+
+def bilateral_foot_clearance(
+    env: ManagerBasedRlEnv,
+    target_height: float = 0.035,
+    rest_height: float = 0.003,
+    min_trunk_height: float = 0.10,
+    max_tilt_deg: float = 30.0,
+    settle_steps: int = 2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    feet_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("left_foot", "right_foot")
+    ),
+) -> torch.Tensor:
+    """Dense 0→1 shaping for BOTH feet rising together. Positive weight.
+
+    The companion to ``simultaneous_flight``, which is binary and pays nothing
+    until the robot is already airborne — no gradient during the long stretch
+    where it is learning to load and extend. This term pays partial credit for
+    a partial lift, so there is something to climb before flight exists.
+
+    Convergent evidence for the metric: an independently trained Microduck hop
+    (joanfox/microduck-happy-hop, task Mjlab-HappyHop-...-Clearance-Flat-
+    Backlash-MicroDuck) used bilateral foot clearance — target 0.035 m, success
+    0.030 m — as its objective and reported a clean crouch/hop/land under
+    backlash and BAM. Sim-only and self-reported, but it is the one known
+    working hop on this robot, and clearance is what it optimised.
+
+    Reward is ``min`` over feet, so the LOWER foot sets the score: a normal
+    stride (one foot at 20 mm, one planted) pays ~zero. Clamped at
+    ``target_height`` so exceeding it earns nothing extra — an uncapped height
+    reward is a jackpot that buys arbitrary violence.
+
+    Clearance is measured ABOVE ``rest_height``, the foot site's standing height
+    (measured: 2.9 mm at STAND on the walk model), so ``target_height`` means
+    actual lift rather than a number partly consumed by the site's resting
+    offset. Re-measure both after any model revision.
+
+    The trunk gates are not redundant with the clearance itself. Feet can be
+    tucked to 35 mm while the robot sits on its trunk going nowhere — the pose
+    scores full marks on clearance alone. ``min_trunk_height`` and
+    ``max_tilt_deg`` are what make this measure a hop rather than a squat.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+
+    origin_z = env.scene.terrain.env_origins[:, 2].unsqueeze(-1)
+    foot_z = torch.nan_to_num(
+        asset.data.site_pos_w[:, feet_cfg.site_ids, 2] - origin_z, nan=0.0
+    )  # (N, n_feet)
+
+    span = max(target_height - rest_height, 1e-6)
+    lift = (foot_z.min(dim=1).values - rest_height) / span
+    lift = lift.clamp(min=0.0, max=1.0)
+
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    quat = asset.data.root_link_quat_w
+    cos_tilt = torch.nan_to_num(
+        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
+    )
+    gate = (
+        (z > min_trunk_height)
+        & (cos_tilt > math.cos(math.radians(max_tilt_deg)))
+        & (env.episode_length_buf > settle_steps)
+    )
+    return lift * gate.float()
