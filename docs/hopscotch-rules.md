@@ -5,10 +5,11 @@ Face Jobs, ultimately deployed to the physical robot.
 
 ## Current state (2026-09-04)
 
-**Upstream merged and pinned; MD-1 in progress.** Upstream `microduck_rl` is merged at
-`1e79c29` (see [`upstream-pin.md`](./upstream-pin.md)). No hopscotch code written yet.
+**Upstream merged and pinned; local CPU loop working.** Upstream `microduck_rl` is merged at
+`1e79c29` (see [`upstream-pin.md`](./upstream-pin.md)). `uv sync` and the 149-test CPU suite pass on
+Windows. First hopscotch code is [`scripts/hopscotch/flight_probe.py`](../scripts/hopscotch/flight_probe.py).
 
-**Next action: finish MD-1** — `uv sync`, HF auth and namespace, then run stock
+**Next action: finish MD-1** — HF auth and namespace, then run stock
 `Mjlab-Velocity-Flat-MicroDuck` via `--hf-jobs` end-to-end.
 
 ## Read these, in this order
@@ -31,11 +32,12 @@ sequence of commands over flat ground — not perception. Designs where the robo
 are unreachable on real hardware. Never delete a command slot; unused slots are zero-padded to keep
 input neurons alive.
 
-**No local GPU; all-remote by choice.** Training requires CUDA (mjlab runs on MuJoCo Warp) and the dev
-machine is Windows without a GPU. We deliberately chose an all-remote loop over WSL2 setup. MD-2's
-preflight harness is what makes that affordable — CPU config tests and a 64-env smoke test run before
-GPU training in the *same* job, so a bad reward sign dies in seconds on `cpu-basic` ($0.01/hr) instead
-of hours into `l4x1` ($0.80/hr).
+**Hybrid, not all-remote.** Only *training* needs CUDA. Verified 2026-09-04 on Windows without a GPU:
+`uv sync` succeeds, upstream's 149 CPU config tests pass in 55 s, and CPU MuJoCo loads the real model —
+so config errors, reward signs and physics checks are caught **locally, in under a minute, for free**.
+Spike **S3** is effectively answered: stay off WSL2, iterate locally, submit only real training runs.
+This demotes MD-2 from load-bearing to an optimization — its CPU stage no longer needs to be remote at
+all, and only its in-job 64-env smoke test still earns its place before `l4x1` ($0.80/hr).
 
 **This repo is a fork of upstream, pinned.** `pollen-robotics/microduck_rl` (Apache 2.0) is kept as a
 git remote and pulled deliberately, not continuously. It is young and moving fast (69 commits on `main`
@@ -46,6 +48,12 @@ lessons and is more trustworthy than reasoning from first principles here.
 **The core new work is one reward term.** mjlab's stock `feet_air_time` rewards *alternating*
 single-foot air time — ordinary walking. A hop needs **simultaneous** flight, both feet off at once.
 That term does not exist upstream and is not a reweighting of one that does.
+
+**Verify physics on CPU before spending GPU.** Upstream calls this the single biggest time-saver, and
+it paid immediately — see [`s1-flight-probe.md`](./s1-flight-probe.md). Two metric traps live here:
+contact-loss is not flight (a duck falling over loses both contacts and logs great "air time"), and
+`current_air_time` is *per-foot* (a normal walk reports 125–300 ms). Simultaneous flight is
+`n_contact == 0`, gated on tilt and trunk rise.
 
 **The open project risk is physics.** No existing Microduck task has a flight phase. It is genuinely
 unknown whether an ~800g biped on compliant, backlash-heavy XL330 servos can leave the ground. MD-3

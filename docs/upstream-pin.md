@@ -69,7 +69,8 @@ tarball the container cannot use.
 ## Verification status (rest of MD-1)
 
 - [x] Upstream retained as a git remote, pinned, pin recorded with rationale
-- [ ] `uv sync` succeeds and is honest (no manually-installed local packages)
+- [x] `uv sync` succeeds and is honest — verified on Windows 2026-09-04, exit 0
+- [x] Upstream's CPU test suite passes locally: **149 passed in 55 s, no GPU**
 - [ ] HF auth working; namespace chosen deliberately (governs repos, uv-cache bucket, **and billing**)
 - [ ] Stock `Mjlab-Velocity-Flat-MicroDuck` submitted via `--hf-jobs`, run to a usable checkpoint
 - [ ] `.pt` checkpoints confirmed landing in the private Hub model repo during training
