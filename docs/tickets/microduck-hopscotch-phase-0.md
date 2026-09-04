@@ -24,6 +24,19 @@ implementation ticket and carries most of the weight. Padding the first two woul
 
 ---
 
+## Status (2026-09-04)
+
+- **MD-1** — in progress. Fork merged and pinned, `uv sync` green, 149 CPU tests green. Remaining:
+  HF auth + namespace, then the `--hf-jobs` run. Checklist: [`../upstream-pin.md`](../upstream-pin.md).
+- **MD-2** — **demoted**. S3 resolved: the CPU stage runs locally in 55 s, so preflight is an
+  optimization, not the thing that makes the loop affordable. Only its in-job smoke test still earns
+  its place. Do MD-3 first.
+- **MD-3** — first acceptance criterion (command-block semantics) is **already done**:
+  [`../command-block.md`](../command-block.md). Two constraints added from the CPU probe
+  ([`../s1-flight-probe.md`](../s1-flight-probe.md)): measure `n_contact == 0` gated on tilt AND
+  trunk rise (contact-loss alone reads a topple as flight), and **do not put motion-blocker penalties
+  on the neck** — head swing looks load-bearing for the hop.
+
 ## Tickets
 
 ### MD-1 — Fork upstream, pin it, and prove the stock pipeline end-to-end (S2)

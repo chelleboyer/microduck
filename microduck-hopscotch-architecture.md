@@ -173,6 +173,14 @@ No existing task has a flight phase; roulade is the most dynamic and a roll neve
 Microduck is ~800g on low-torque, compliant, backlash-heavy XL330 servos. Whether a true flight phase is
 achievable at all is genuinely unknown, and it determines the shape of the entire project.
 
+**Update 2026-09-04 — CPU pre-check run, S1 still open.** A free open-loop probe
+([`docs/s1-flight-probe.md`](./docs/s1-flight-probe.md), `scripts/hopscotch/flight_probe.py`) found a
+best case of **~34 ms simultaneous flight, ~11 mm rise, landing upright** — the low end of the
+ambiguous band. Torque-saturated (so a real ceiling for open-loop), but optimistic (no BAM back-EMF,
+backlash or DR). A policy can still beat it: the head is 280 g of a 737 g robot and the probe holds it
+rigid. **Measure `n_contact == 0` gated on tilt and rise — per-foot `current_air_time` reports
+125-300 ms for an ordinary walk.**
+
 ```
 Question:      Can Microduck achieve a real flight phase (both feet off ground, measurable air time)?
 Spike:         Velocity-derived env, reward air-time + upright landing only, minimal regularizers.
@@ -188,7 +196,9 @@ confirm namespace/billing, checkpoint upload, wandb streaming, and the 12h timeo
 rule: if checkpoints land in the Hub repo and wandb streams, the pipeline is trusted and we never
 revisit it. Run before or alongside S1.
 
-**S3 — Is the all-remote loop actually tolerable?**
+**S3 — Is the all-remote loop actually tolerable?** *(RESOLVED 2026-09-04: the loop is HYBRID, not
+all-remote. `uv sync` and upstream's 149 CPU config tests pass on Windows with no GPU, in 55 s. Iterate
+locally; submit only real training. This demotes MD-2 to an optimization.)*
 Our dev-loop choice is the one with real uncertainty. After ~5 preflight-pattern iterations, judge it.
 Decision rule: if config errors are reliably caught in the CPU preflight stage and turnaround is
 acceptable, stay all-remote. If we are repeatedly burning GPU minutes on errors a local test would have
@@ -201,9 +211,12 @@ via `scripts/infer_policy.py` before deploying to the physical robot.
 
 ## Open questions
 
-- **Exact command-block semantics.** The 13D layout is `[twist(3), head_pose(4), body_pose(6)]`, but the
-  precise meaning of each `body_pose` component must be read from `microduck_constants.py` and
-  `microduck_velocity_env_cfg.py` after forking. This settles the hop command encoding.
+- ~~**Exact command-block semantics.**~~ **RESOLVED 2026-09-04** — see
+  [`docs/command-block.md`](./docs/command-block.md). `body_pose` is `[x, y, z, roll, pitch, yaw]`,
+  a delta from nominal standing (`nominal_height=0.095`), and the velocity env carries the whole
+  6D block at **reward weight 0**. So the entire block is free. Hop intent goes in `body_pose[2]`,
+  and `body_pose_tracking` **stays at weight 0** — tracking a commanded height rewards standing tall,
+  which beats flight.
 - **Does the fork pin or track upstream?** Upstream is actively developed. Default is pin-and-pull-
   deliberately; revisit if they ship something we want.
 - **Is "hopscotch" one policy or several?** A single commanded gait covering all hop types is cleanest,
