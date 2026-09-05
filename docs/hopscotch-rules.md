@@ -44,6 +44,34 @@ output unless `PYTHONIOENCODING=utf-8` is set (the job itself is unaffected, but
 reports failure), and the `[wandb] forwarding API key from ~/.netrc` message names the wrong file when
 the key came from `_netrc`.
 
+> **The encoding bug is broader than "the log streamer".** It also kills `uv run train --help`
+> outright, locally, with the same `UnicodeEncodeError: 'charmap' codec`. Prefix
+> `PYTHONIOENCODING=utf-8` on any `train` invocation on Windows.
+
+## Session 3 state (2026-09-05)
+
+**S5 is implemented and training.** Run `s5-forward-hop`, job `6a9bf2e6259f8e97255e28a5`,
+`Mjlab-HopForward-Flat-MicroDuck`, 4096 envs × 1500 iters, video on; checkpoints and mp4s land in
+`chelleboyer/s5-forward-hop`.
+
+- **Video works end-to-end** — the first mp4s ever recovered from a job
+  (`chelleboyer/s5-video-smoke2`). It took three attempts, because `--video` needs a GL backend the
+  stock image lacks: **GLFW fails** (no Xlib), and **EGL fails worse** (no vendor library, so
+  `import mujoco` itself dies — breaking *every* job, not just video ones). `osmesa` plus an
+  apt-installed `libosmesa6` is the working answer, gated behind `_wants_video()` so ordinary runs
+  keep the stock import path untouched.
+- **New rewards** in `mdp.py`: `forward_flight_progress` (E1), `hop_landing_quality`,
+  `hop_landing_impact_penalty`. Test suite 199 → 247.
+- **The S5 threshold is measured, not asserted**: open-loop forward travel is **8.0 mm/hop**, so the
+  old 5 cm placeholder was ~6× beyond what physics delivers and would have failed a genuinely
+  successful run. Pass mark ≥25 mm, fail ≤8 mm.
+- **OPEN — is `forward_flight_progress` actually reachable?** It logged `0.0000` for all 5 smoke
+  iterations. That is consistent with alive-but-below-4-decimal-precision (a random policy is airborne
+  ~0.05% of steps, and E1 additionally needs positive forward velocity), and its unit tests prove it
+  pays 1.0 in the right state — but it is **not confirmed non-zero on real data**. Check this first on
+  the real run: if it is still exactly 0 once `simultaneous_flight` climbs, the gate is unreachable and
+  the term needs loosening, not tuning.
+
 ## Read these, in this order
 
 1. [`../CLAUDE.md`](../CLAUDE.md) — **upstream's playbook.** Env-building workflow, invariants, joint
