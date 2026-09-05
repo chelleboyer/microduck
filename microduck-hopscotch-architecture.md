@@ -358,8 +358,21 @@ submit only real training.
   Pollen Robotics. Not decided; costs discipline, reversible either way. Note the sim-only scope makes our
   work less directly useful to them, since their interest is hardware.
 
+**S5.1 is built (2026-09-05, session 4).** `hop_displacement` (takeoff→touchdown distance along the
+takeoff heading, paid across the landing window, capped at 10 cm) is now the forward env's main term,
+handed the lead from `simultaneous_flight` by a curriculum at iter 300 rather than swapped in — a term
+that only pays at a landing from a genuine flight is silent until flight exists, so leading with it
+would violate the phase-alignment rule. `forward_flight_progress` keeps its E1 role as the dense
+in-flight ramp at a raised (0.8 m/s) cap and a demoted weight. Head posture is priced at touchdown
+only. The forward variant evolved in place; the hop-in-place baseline remains the untouched A/B
+reference. **Not yet smoke-tested** — the dev machine has no CUDA, so the env has never been stepped
+with these terms.
+
 ## Revision history
 
+- **2026-09-05, session 4** — **S5.1 implemented**: per-hop displacement replaces air time as the
+  forward env's objective, via a phase-aligned handover curriculum; forward cap raised off saturation;
+  head priced at touchdown. 278 CPU tests green. The GPU smoke test is owed before the next run.
 - **2026-09-04, session 1** — original decisions. Approach A chosen; B rejected as undeployable; C
   rejected as brittle. S1 blocking.
 - **2026-09-04, session 2** — S2 and S3 resolved. Command-block semantics resolved. Hop env and both

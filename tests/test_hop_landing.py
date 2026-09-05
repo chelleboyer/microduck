@@ -20,6 +20,7 @@ import math
 import torch
 
 from mjlab_microduck.tasks.mdp import (
+    _HEAD_TOP_AXIS,
     hop_landing_impact_penalty,
     hop_landing_quality,
 )
@@ -42,7 +43,7 @@ class _Sensor:
 
 
 class _AssetData:
-    def __init__(self, n, z, quat, vz):
+    def __init__(self, n, z, quat, vz, head_quat=None):
         self.root_link_pos_w = torch.zeros(n, 3)
         self.root_link_pos_w[:, 2] = torch.as_tensor(z, dtype=torch.float32)
         self.root_link_quat_w = (
@@ -50,11 +51,22 @@ class _AssetData:
         )
         self.root_link_lin_vel_w = torch.zeros(n, 3)
         self.root_link_lin_vel_w[:, 2] = torch.as_tensor(vz, dtype=torch.float32)
+        # (n, n_bodies, 4) — one body is enough; jaw_soft resolves to index 0.
+        self.body_link_quat_w = (
+            torch.as_tensor(head_quat or LEVEL_HEAD, dtype=torch.float32)
+            .expand(n, 4)
+            .clone()
+            .unsqueeze(1)
+        )
 
 
 class _Asset:
     def __init__(self, data):
         self.data = data
+
+    def find_bodies(self, name):
+        assert name == "jaw_soft", name
+        return [0], [name]
 
 
 class _Terrain:
@@ -74,12 +86,17 @@ class _Scene:
 class _Env:
     """last_air / contact_t are per-foot (left, right), like the real sensor."""
 
-    def __init__(self, last_air, contact_t, z=STAND_Z, quat=UPRIGHT, vz=0.0, step=100):
+    def __init__(
+        self, last_air, contact_t, z=STAND_Z, quat=UPRIGHT, vz=0.0, step=100,
+        head_quat=None,
+    ):
         last_air = torch.as_tensor(last_air, dtype=torch.float32)
         contact_t = torch.as_tensor(contact_t, dtype=torch.float32)
         n = last_air.shape[0]
         self.scene = _Scene(
-            _Sensor(last_air, contact_t), _Asset(_AssetData(n, z, quat, vz)), n
+            _Sensor(last_air, contact_t),
+            _Asset(_AssetData(n, z, quat, vz, head_quat)),
+            n,
         )
         self.episode_length_buf = torch.full((n,), step, dtype=torch.long)
 
@@ -87,6 +104,20 @@ class _Env:
 def _quat_pitch(deg):
     h = math.radians(deg) / 2.0
     return (math.cos(h), 0.0, math.sin(h), 0.0)
+
+
+# The head-top axis sits at atan2(a, c) off jaw_soft's local +z, so a pitch of
+# that much brings it level. Derived from the constant rather than hardcoded, so
+# a re-measured axis re-derives the tests instead of silently invalidating them.
+_HEAD_LEVEL_DEG = math.degrees(math.atan2(_HEAD_TOP_AXIS[0], _HEAD_TOP_AXIS[2]))
+
+
+def _head_quat(droop_deg):
+    """Head pitched `droop_deg` off vertical (0 = carried level)."""
+    return _quat_pitch(droop_deg - _HEAD_LEVEL_DEG)
+
+
+LEVEL_HEAD = _head_quat(0.0)
 
 
 def _landed(**kw):
@@ -163,6 +194,60 @@ def test_quality_nan_does_not_pay():
     env = _Env(last_air=[[float("nan"), FLEW]], contact_t=[[0.02, 0.02]])
     out = _quality(env)
     assert torch.isfinite(out).all() and out.tolist() == [0.0]
+
+
+# ------------------------------------------------------- head at touchdown ----
+# S5.1. The head rides low because this env deliberately FREED it so its 280 g
+# could act as a countermovement — right in flight, wrong at touchdown. So the
+# posture is priced HERE and only here.
+
+HEAD_STD = 0.35  # what the cfg passes
+
+
+def _q_head(env, **kw):
+    return _quality(env, head_upright_std=HEAD_STD, **kw)
+
+
+def test_head_factor_is_off_by_default():
+    # Callers without a jaw_soft body — and the pre-S5.1 behaviour — must be
+    # untouched. A drooping head changes nothing unless the factor is asked for.
+    a = _quality(_landed(head_quat=_head_quat(0.0))).item()
+    b = _quality(_landed(head_quat=_head_quat(70.0))).item()
+    assert math.isclose(a, b, rel_tol=1e-6)
+
+
+def test_level_head_keeps_essentially_all_of_the_landing_reward():
+    assert _q_head(_landed(head_quat=_head_quat(0.0))).item() > 0.9
+
+
+def test_drooping_head_is_scored_down_monotonically():
+    scores = [
+        _q_head(_landed(head_quat=_head_quat(d))).item() for d in (0, 20, 45, 70)
+    ]
+    assert scores == sorted(scores, reverse=True), scores
+    assert scores[-1] < 0.5 * scores[0]
+
+
+def test_a_badly_drooped_head_still_scores_visibly():
+    # CLAUDE.md: a multiplicative factor tighter than the CURRENT policy's error
+    # collapses the product and the gradient with it. This term was already the
+    # weakest in the S5 stack, so the wide std is load-bearing, not slack.
+    assert _q_head(_landed(head_quat=_head_quat(60.0))).item() > 0.05
+
+
+def test_head_factor_never_pays_outside_a_landing():
+    env = _Env(
+        last_air=[[0.001, 0.001]], contact_t=[[0.02, 0.02]], head_quat=_head_quat(0.0)
+    )
+    assert _q_head(env).tolist() == [0.0]
+
+
+def test_head_nan_reads_as_drooped_not_level():
+    # A NaN that read as "level" would hand out full marks for an unknown pose.
+    env = _landed(head_quat=(float("nan"), 0.0, 0.0, 0.0))
+    out = _q_head(env)
+    assert torch.isfinite(out).all()
+    assert out.item() < 0.05
 
 
 # ----------------------------------------------------------------- impact ----

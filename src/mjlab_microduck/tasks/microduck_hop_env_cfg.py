@@ -100,6 +100,52 @@ explicitly not from a walking stride).
    architecture doc because velocity tracking has a strictly easier solution
    than hopping.
 
+S5.1 — THE RESHAPE AFTER S5's RUN (forward=True, 2026-09-05)
+------------------------------------------------------------
+S5 ran to completion and the duck hops forward — confirmed on video, with
+forward_flight_progress at ~95% of its cap. It also proved the reward SHAPE
+wrong, and deviations 11-13 are that fix. The env evolves in place rather than
+forking a third variant: the hop-in-place baseline is the A/B reference (and is
+still untouched), the S5 recipe is reproducible from git plus its wandb run,
+and a task id that means "the current best forward hop" is more useful than a
+growing flag matrix.
+
+11. **hop_displacement is now the main term** (weight 10.0 after handover),
+   and simultaneous_flight demotes 5.0 -> 2.0. simultaneous_flight pays 1.0 PER
+   STEP airborne, so air time WAS the objective: the run ended up airborne ~52%
+   of its life (2.58 / 5.0) while hop_landing_quality stayed the weakest term
+   in the stack (0.138). That is bouncing, not hopping. Displacement pays for
+   "took off HERE, landed THERE", once per hop, capped — hanging in the air
+   earns nothing by itself. This converges with E3 (commanded hop distance)
+   instead of competing with it: E3 is this measurement plus a command.
+
+   The handover is a CURRICULUM, not a swap, because the two terms are phase-
+   aligned to different skills. Flight must be DISCOVERED before displacement
+   means anything (a term that pays only at a landing from a genuine flight is
+   silent until flight exists), so flight leads until iter 300 and displacement
+   takes over after. CLAUDE.md: never introduce a term before the skill it
+   prices exists.
+
+   Weights are set by reward MASS, not by their face values. Under S5 a single
+   ~0.12 s hop earned roughly 5.0 x 6 steps = 30 from flight alone; a 45 mm hop
+   here earns 10.0 x 0.45 x ~7 window steps = ~32. The same money, paid for
+   arriving instead of for hanging.
+
+12. **The head is priced AT TOUCHDOWN, and only there.** hop_landing_quality
+   gains a head-upright factor (std 0.35, deliberately wide) and head_pose_bias
+   returns on a late, gentle ramp — 0.5/1.0 against the walker's 1.0/2.0/3.0.
+   The head rides low because deviation 3 freed it on purpose, and that trade
+   is still right in flight; it is wrong at landing. Raising
+   head_pose_tracking is NOT the fix — see note 3 and the receipt at
+   microduck_velocity_env_cfg.py:729-737.
+
+13. **FORWARD_VEL_CAP 0.4 -> 0.8 m/s, and the term demotes 1.5 -> 0.5.** The run
+   logged ~95% of the 0.4 cap: SATURATED, so the metric could no longer tell a
+   good hop from a great one. It also pays per airborne step, which is the same
+   shape the displacement term exists to replace — so it keeps its job as the
+   dense in-flight ramp (the role bilateral_foot_clearance plays under flight)
+   and loses its claim to being a driver.
+
 COMMAND ENCODING
 ----------------
 Hop intent lives in **body_pose[2]** (the z component), per docs/command-block.md.
@@ -171,11 +217,12 @@ FOOT_REST_HEIGHT = 0.0029
 ACTION_RATE_KICKIN_ITER = 400
 
 # ── S5 / forward=True constants (docstring notes 8-10) ────────────────────────
-# Forward speed at which the E1 term saturates, m/s. Matched to the velocity
-# env's walking command ceiling; re-derive against the flight probe's measured
-# open-loop forward reach. Too low caps a good hop, too high leaves the term
-# flat across the achievable range and kills its gradient.
-FORWARD_VEL_CAP = 0.4
+# Forward speed at which the E1 term saturates, m/s. RAISED 0.4 -> 0.8 after the
+# S5 run logged ~95% of the old cap: a saturated metric cannot distinguish good
+# from great, and the term is flat exactly where the policy now lives. Too low
+# caps a good hop; too high leaves the term flat across the achievable range and
+# kills its gradient. Re-derive whenever a run pins it again.
+FORWARD_VEL_CAP = 0.8
 # MEASURED walk-model settle height. NOT the velocity env's nominal_height
 # (0.095), which is ~22 mm low and survives only because body_pose_tracking
 # runs at weight 0 — see docs/command-block.md.
@@ -188,6 +235,34 @@ IMPACT_WINDOW_S = 0.04
 # Down from the walker's 2.0. See docstring note 10 — this is the line that
 # makes E1 reachable at all.
 HOP_TRACK_LIN_VEL_WEIGHT = 0.3
+
+# ── S5.1 constants (docstring notes 11-13) ────────────────────────────────────
+# Per-hop forward travel at which the displacement reward saturates, m.
+# DERIVED, and to be re-derived: the S5 policy flew at ~0.38 m/s (95% of the old
+# 0.4 cap) for flight phases of roughly 0.1-0.15 s, i.e. ~40-60 mm per hop. A
+# 0.10 m cap leaves ~2x headroom above that so the term keeps a gradient as the
+# policy improves, while S5's 25 mm pass mark still scores a visible 0.25.
+HOP_DISP_CAP = 0.10
+# Final weight of the main term. Sized by reward MASS against what a hop used to
+# earn from air time — see docstring note 11 — not by comparison with the face
+# value of the per-step terms around it.
+HOP_DISP_WEIGHT = 10.0
+# Iteration at which displacement takes over from flight. Phase alignment, not a
+# schedule: flight leads while the skill is being discovered, displacement leads
+# once it exists. Keyed to ACTION_RATE_KICKIN_ITER (400), which S5 established as
+# "the skill is consolidated by roughly here"; set a little earlier because a
+# resumed run arrives with the skill already in hand.
+DISP_HANDOVER_ITER = 300
+# Flight after the handover. Not zero: leaving the ground stays a prerequisite,
+# and displacement is silent until it happens. Must stay ABOVE the clearance
+# ramp below, or a deep tuck outranks the goal it is supposed to ramp toward.
+FLIGHT_WEIGHT_AFTER_HANDOVER = 2.0
+CLEARANCE_WEIGHT_FORWARD = 1.5
+# Head-upright factor at touchdown. WIDE on purpose (~55° of droop at 1 e-fold):
+# a multiplicative factor tighter than the current policy's error collapses the
+# product and the gradient with it, and hop_landing_quality was already the
+# weakest term in the S5 stack. Tighten once the head actually comes up.
+LANDING_HEAD_UPRIGHT_STD = 0.35
 
 
 def make_microduck_hop_env_cfg(
@@ -266,9 +341,29 @@ def make_microduck_hop_env_cfg(
 
     # ── S5: forward travel + landing quality (docstring notes 8-10) ───────────
     if forward:
+        # THE MAIN TERM (note 11). Starts at 0 and is handed the lead by the
+        # curriculum below — displacement is unearnable until flight exists, so
+        # weighting it from step 0 would just be a term that logs zero while
+        # the policy learns something else.
+        cfg.rewards["hop_displacement"] = RewardTermCfg(
+            func=microduck_mdp.hop_displacement,
+            weight=0.0,
+            params={
+                "sensor_name": "feet_ground_contact",
+                "disp_cap": HOP_DISP_CAP,
+                "min_flight_s": FLIGHT_MIN_S,
+                # Same window as hop_landing_quality: one event, one window.
+                "landing_window_s": LANDING_WINDOW_S,
+                "max_tilt_deg": FLIGHT_MAX_TILT_DEG,
+            },
+        )
+
         cfg.rewards["forward_flight_progress"] = RewardTermCfg(
             func=microduck_mdp.forward_flight_progress,
-            weight=1.5,
+            # Demoted 1.5 -> 0.5 (note 13): it pays per airborne step, which is
+            # the shape displacement replaces. It stays as the dense in-flight
+            # ramp, the role clearance plays under flight.
+            weight=0.5,
             params={
                 "sensor_name": "feet_ground_contact",
                 "vel_cap": FORWARD_VEL_CAP,
@@ -279,12 +374,19 @@ def make_microduck_hop_env_cfg(
             },
         )
 
+        # 1.0 -> 2.0: it was the weakest term in the S5 stack (0.138) precisely
+        # because nothing else paid for the landing either. Now that
+        # displacement pays at the same instant, posture at touchdown needs
+        # enough mass to shape HOW the duck arrives, not just THAT it does.
         cfg.rewards["hop_landing_quality"] = RewardTermCfg(
             func=microduck_mdp.hop_landing_quality,
-            weight=1.0,
+            weight=2.0,
             params={
                 "sensor_name": "feet_ground_contact",
                 "target_height": LANDING_TARGET_Z,
+                # Note 12 — the head is priced HERE, at touchdown, and nowhere
+                # else in flight.
+                "head_upright_std": LANDING_HEAD_UPRIGHT_STD,
                 "min_flight_s": FLIGHT_MIN_S,
                 "landing_window_s": LANDING_WINDOW_S,
             },
@@ -307,6 +409,11 @@ def make_microduck_hop_env_cfg(
         # The line that makes E1 reachable — docstring note 10.
         cfg.rewards["track_linear_velocity"].weight = HOP_TRACK_LIN_VEL_WEIGHT
 
+        # Clearance stays the dense ramp but steps back with the term it ramps
+        # toward, so the documented ordering survives the handover:
+        # clearance < flight < displacement at every stage.
+        cfg.rewards["bilateral_foot_clearance"].weight = CLEARANCE_WEIGHT_FORWARD
+
     # ── Curricula ─────────────────────────────────────────────────────────────
     # The velocity env ramps head_pose_bias from iter 600. Drop it: it is a
     # posture-precision tax on the head, and the head is a load-bearing part of
@@ -326,6 +433,56 @@ def make_microduck_hop_env_cfg(
             ],
         },
     )
+
+    if forward:
+        # THE HANDOVER (note 11). Two halves of one transition, deliberately
+        # sharing a boundary: flight leads while the skill is discovered, then
+        # displacement leads. Splitting the boundary would leave a window where
+        # neither term is the objective.
+        cfg.curriculum["hop_displacement_weight"] = CurriculumTermCfg(
+            func=microduck_mdp.reward_weight,
+            params={
+                "reward_name": "hop_displacement",
+                "weight_stages": [
+                    {"step": 0, "weight": 0.0},
+                    {"step": DISP_HANDOVER_ITER * NUM_STEPS_PER_ENV,
+                     "weight": HOP_DISP_WEIGHT * 0.5},
+                    {"step": 2 * DISP_HANDOVER_ITER * NUM_STEPS_PER_ENV,
+                     "weight": HOP_DISP_WEIGHT},
+                ],
+            },
+        )
+        cfg.curriculum["flight_weight"] = CurriculumTermCfg(
+            func=microduck_mdp.reward_weight,
+            params={
+                "reward_name": "simultaneous_flight",
+                "weight_stages": [
+                    {"step": 0, "weight": 5.0},
+                    {"step": DISP_HANDOVER_ITER * NUM_STEPS_PER_ENV, "weight": 3.0},
+                    {"step": 2 * DISP_HANDOVER_ITER * NUM_STEPS_PER_ENV,
+                     "weight": FLIGHT_WEIGHT_AFTER_HANDOVER},
+                ],
+            },
+        )
+
+        # Note 12: head_pose_bias comes BACK for the forward variant — L1 on a
+        # 1 s EMA, which charges the DC droop while letting the countermovement
+        # oscillation cancel. Far gentler and later than the walker's
+        # 1.0/2.0/3.0 ramp, because here the head is a load-bearing part of the
+        # hop and the touchdown factor in hop_landing_quality is doing the
+        # primary work. Arrives after the handover, never during discovery.
+        cfg.rewards["head_pose_bias"].weight = 0.0
+        cfg.curriculum["head_pose_bias_weight"] = CurriculumTermCfg(
+            func=microduck_mdp.reward_weight,
+            params={
+                "reward_name": "head_pose_bias",
+                "weight_stages": [
+                    {"step": 0, "weight": 0.0},
+                    {"step": 800 * NUM_STEPS_PER_ENV, "weight": 0.5},
+                    {"step": 1200 * NUM_STEPS_PER_ENV, "weight": 1.0},
+                ],
+            },
+        )
 
     return cfg
 

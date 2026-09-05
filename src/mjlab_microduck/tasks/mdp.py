@@ -6684,19 +6684,29 @@ def _lateral_axis_z(quat: torch.Tensor) -> torch.Tensor:
     return 2.0 * (quat[:, 2] * quat[:, 3] + quat[:, 0] * quat[:, 1])
 
 
-def _head_top_down(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
-    """True where the head-top axis points at the floor (dot with -z > min)."""
-    if not hasattr(env, "_roulade_head_body_id"):
+def _head_top_axis_world_z(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """World-z component of the head-top axis. +1 = head level, -1 = upside down.
+
+    Shared by roulade (which wants it pointing DOWN — the flat top of the head
+    on the floor) and by the hop landing term (which wants it pointing UP — the
+    head carried level at touchdown). One computation, one body-id cache, so
+    the two can never disagree about which axis "head up" means.
+    """
+    if not hasattr(env, "_head_top_body_id"):
         ids, _ = asset.find_bodies("jaw_soft")
-        env._roulade_head_body_id = ids[0]
-    q = asset.data.body_link_quat_w[:, env._roulade_head_body_id]
+        env._head_top_body_id = ids[0]
+    q = asset.data.body_link_quat_w[:, env._head_top_body_id]
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     a, b, c = _HEAD_TOP_AXIS
     # z-component of R(q) @ axis_local
-    axis_world_z = (
+    return (
         2.0 * (x * z - w * y) * a + 2.0 * (y * z + w * x) * b + (1.0 - 2.0 * (x * x + y * y)) * c
     )
-    return axis_world_z < -_HEAD_TOP_DOWN_MIN
+
+
+def _head_top_down(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """True where the head-top axis points at the floor (dot with -z > min)."""
+    return _head_top_axis_world_z(env, asset) < -_HEAD_TOP_DOWN_MIN
 
 
 def _sensor_any_contact(env: ManagerBasedRlEnv, name: str) -> torch.Tensor | None:
@@ -7491,6 +7501,7 @@ def hop_landing_quality(
     target_height: float = 0.1167,
     height_std: float = 0.02,
     upright_std: float = 0.3,
+    head_upright_std: float | None = None,
     min_flight_s: float = 0.02,
     landing_window_s: float = 0.15,
     settle_steps: int = 2,
@@ -7511,6 +7522,27 @@ def hop_landing_quality(
     constant is ~22 mm low and survives only because ``body_pose_tracking``
     runs at weight 0; see docs/command-block.md. Re-measure after any model
     revision — a 5 mm error here has cost this project days before.
+
+    HEAD UPRIGHT (S5.1, opt-in via ``head_upright_std``). The S5 policy hops
+    with its head riding low, because this env deliberately FREED the head
+    (deviation 3: head_pose_tracking 2.0 → 0.5, bias curriculum removed) so its
+    280 g could act as a countermovement. That trade is right in flight and
+    wrong at touchdown, so the fix belongs HERE — priced only in the landing
+    window, leaving mid-flight swing free. Do NOT fix it by raising
+    ``head_pose_tracking``: microduck_velocity_env_cfg.py:729-737 records that
+    tightening an always-on head term made the policy stop moving entirely.
+
+    Measured as the head-top axis's world-z component, not as neck joint error,
+    on purpose: a head can droop in the world while every joint reads its
+    default, if the trunk is pitched. "Head up" is a world-frame fact, like the
+    impact term's vz. Default OFF so callers without a ``jaw_soft`` body (and
+    the pre-S5.1 landing behaviour) are unaffected.
+
+    ``head_upright_std`` is deliberately WIDE (the cfg passes 0.35, ~55° of
+    droop at 1 e-fold). CLAUDE.md: a multiplicative factor whose std is tighter
+    than the current policy's error collapses the whole product to ~0 and the
+    gradient becomes invisible — and this term was already the weakest in the
+    S5 stack at 0.138. Tighten it only once the head actually comes up.
     """
     asset: Entity = env.scene[asset_cfg.name]
 
@@ -7526,9 +7558,16 @@ def hop_landing_quality(
     )
     height_g = torch.exp(-((z - target_height) / height_std) ** 2)
 
+    out = upright_g * height_g
+    if head_upright_std is not None:
+        # NaN head orientation must read as fully drooped, not as level.
+        head_up = torch.nan_to_num(_head_top_axis_world_z(env, asset), nan=-1.0)
+        droop = (1.0 - head_up).clamp(min=0.0)
+        out = out * torch.exp(-((droop / head_upright_std) ** 2))
+
     landed = _hop_just_landed(env, sensor_name, min_flight_s, landing_window_s)
     settled = env.episode_length_buf > settle_steps
-    return upright_g * height_g * (landed & settled).float()
+    return out * (landed & settled).float()
 
 
 def hop_landing_impact_penalty(
@@ -7569,3 +7608,221 @@ def hop_landing_impact_penalty(
     landed = _hop_just_landed(env, sensor_name, min_flight_s, impact_window_s)
     settled = env.episode_length_buf > settle_steps
     return -excess * (landed & settled).float()
+
+
+# ==============================================================================
+# Hopscotch — S5.1: displacement paid AT LANDING, replacing air time as the goal
+# ==============================================================================
+#
+# WHY THIS EXISTS. The S5 run (4096 envs x 1500 iters, job 6a9bf2e6...) produced
+# a working forward bunny hop AND the diagnosis that its reward SHAPE was wrong.
+# ``simultaneous_flight`` pays 1.0 PER STEP while airborne, so AIR TIME was the
+# objective — and the policy took that to its logical end, spending ~52% of its
+# life off the ground (logged 2.58 / weight 5.0) while ``hop_landing_quality``
+# stayed the weakest term in the stack at 0.138. It bounces; it does not hop TO
+# anywhere. The duration of one flight was capped by ``max_flight_s``; the
+# FRACTION OF LIFE SPENT FLYING never was, so CLAUDE.md's no-jackpot rule was
+# enforced on one axis and not the other.
+#
+# The replacement, per the architecture doc: **take off HERE -> land THERE**.
+# Displacement between the takeoff point and the touchdown point, paid once per
+# hop at the landing, capped. Hanging in the air pays nothing by itself;
+# arriving somewhere does. Hopscotch is about landing in a square, so this is
+# also the shape the task actually wants.
+#
+# NOT throwaway work for E3 (commanded hop distance in body_pose[0]): E3 is
+# exactly this measurement compared against a command, so the takeoff latch
+# built here is the piece E3 was always going to need.
+
+
+def _heading_xy(quat: torch.Tensor) -> torch.Tensor:
+    """Unit world-frame XY heading (the body +x axis, projected and normalized).
+
+    Body-frame forward, like ``forward_flight_progress`` and for the same
+    reason: "hopped forward" means relative to where the duck was FACING at
+    takeoff, so a duck that turns 90° and drifts sideways scores nothing.
+
+    A near-vertical body (nose straight up) projects to ~0 and normalizes to a
+    meaningless direction — harmless, because every consumer gates on tilt.
+    """
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    v = torch.stack((1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z)), dim=-1)
+    v = torch.nan_to_num(v, nan=0.0)
+    return v / v.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+
+# Sentinel for "this env is not inside a landing window" — larger than any
+# window a caller would set, so the payment condition is a plain comparison.
+_HOP_NO_LANDING = 1.0e6
+
+
+def _hop_displacement_state(env: ManagerBasedRlEnv) -> None:
+    """Lazily create the per-env takeoff latch (roulade's state idiom)."""
+    n = env.num_envs
+    if not hasattr(env, "_hop_takeoff_xy") or env._hop_takeoff_xy.shape[0] != n:
+        env._hop_takeoff_xy = torch.zeros(n, 2, device=env.device)
+        env._hop_takeoff_fwd = torch.zeros(n, 2, device=env.device)
+        env._hop_takeoff_fwd[:, 0] = 1.0
+        env._hop_last_disp = torch.zeros(n, device=env.device)
+        env._hop_was_airborne = torch.zeros(n, dtype=torch.bool, device=env.device)
+        # Seconds since the landing edge of the latched hop. _HOP_NO_LANDING
+        # means "no live landing", which is the state everything starts in.
+        env._hop_since_land = torch.full((n,), _HOP_NO_LANDING, device=env.device)
+        env._hop_disp_last_step = -1
+
+
+def _update_hop_displacement(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    min_flight_s: float,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Advance the takeoff latch one control step; return the latched hop distance.
+
+    Step-guarded on ``common_step_counter`` so several terms reading the latch
+    in one step (E3 will) cannot double-advance it — the same guard
+    ``_update_roulade_accum`` uses.
+
+    The latch needs no takeoff EDGE detection: while any foot is down, the
+    takeoff point is simply refreshed to the current pose, so at the instant the
+    last foot leaves it already holds the pose the robot left from. Order
+    matters and is the one subtle thing here — the landing edge must be settled
+    BEFORE the re-arm, or a touchdown would overwrite the takeoff point with the
+    landing point and every hop would measure zero.
+
+    Reset-awareness is handled inline (``episode_length_buf <= 1``) rather than
+    by an event term, the way ``head_pose_bias_penalty`` handles its EMA: any
+    cfg that adds the reward gets correct resets without also having to
+    register an event, which is exactly the kind of wiring that gets forgotten.
+    Without it, an env that resets mid-flight would bank the teleport from its
+    old position to its spawn as a hop.
+    """
+    _hop_displacement_state(env)
+    step = int(env.common_step_counter)
+    if step == env._hop_disp_last_step:
+        return env._hop_last_disp
+    env._hop_disp_last_step = step
+
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time
+    last_air = sensor.data.last_air_time
+    assert air_time is not None, f"sensor {sensor_name!r} reports no air time"
+    assert last_air is not None, f"sensor {sensor_name!r} reports no last_air_time"
+
+    # min across feet: time since the LAST foot left, so > 0 iff n_contact == 0.
+    airborne = torch.nan_to_num(air_time, nan=0.0).min(dim=1).values > 0.0
+
+    asset: Entity = env.scene[asset_cfg.name]
+    xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+
+    # 1. Landing edge, while the latch still holds the takeoff pose.
+    zeros = torch.zeros_like(env._hop_last_disp)
+    flew = torch.nan_to_num(last_air, nan=0.0).min(dim=1).values
+    banked = ((xy - env._hop_takeoff_xy) * env._hop_takeoff_fwd).sum(dim=-1)
+    landed_now = (~airborne) & env._hop_was_airborne
+    genuine = landed_now & (flew >= min_flight_s)
+    env._hop_last_disp = torch.where(
+        landed_now, torch.where(genuine, banked, zeros), env._hop_last_disp
+    )
+
+    # 1b. The payment window is driven by THIS latch, not by re-reading the
+    # contact sensor. A hop's distance must be collectable exactly once, by the
+    # landing that produced it: the sensor view (`_hop_just_landed`) reopens
+    # whenever one foot flickers down, which would let a policy hop forward once
+    # and then farm the stale distance by tapping a single foot.
+    env._hop_since_land = torch.where(
+        airborne,
+        torch.full_like(env._hop_since_land, _HOP_NO_LANDING),   # no live landing
+        torch.where(
+            genuine,
+            zeros,                                               # window opens
+            torch.where(
+                landed_now,
+                torch.full_like(env._hop_since_land, _HOP_NO_LANDING),
+                env._hop_since_land + float(env.step_dt),        # window ages out
+            ),
+        ),
+    )
+
+    # 2. Re-arm: while grounded, the takeoff pose is just the current pose.
+    grounded = (~airborne).unsqueeze(-1)
+    fwd = _heading_xy(asset.data.root_link_quat_w)
+    env._hop_takeoff_xy = torch.where(grounded, xy, env._hop_takeoff_xy)
+    env._hop_takeoff_fwd = torch.where(grounded, fwd, env._hop_takeoff_fwd)
+    env._hop_was_airborne = airborne
+
+    # 3. Freshly reset envs bank nothing from the previous episode.
+    fresh = env.episode_length_buf <= 1
+    env._hop_last_disp = torch.where(fresh, zeros, env._hop_last_disp)
+    env._hop_takeoff_xy = torch.where(fresh.unsqueeze(-1), xy, env._hop_takeoff_xy)
+    env._hop_was_airborne = env._hop_was_airborne & ~fresh
+    env._hop_since_land = torch.where(
+        fresh, torch.full_like(env._hop_since_land, _HOP_NO_LANDING), env._hop_since_land
+    )
+    return env._hop_last_disp
+
+
+def hop_displacement(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    disp_cap: float = 0.10,
+    min_flight_s: float = 0.02,
+    landing_window_s: float = 0.15,
+    max_tilt_deg: float = 30.0,
+    settle_steps: int = 2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Forward distance travelled by ONE hop, paid at its landing. [0, 1].
+
+    Positive weight, and the main term of the forward-hop env — it replaces
+    ``simultaneous_flight`` in that role (see this section's header for the run
+    data that forced the change). Air time is now a means: the only way to
+    collect is to leave the ground, go somewhere, and come down upright.
+
+    Paid ACROSS the landing window rather than as a single-step impulse. The
+    expected value is the same and the variance is far lower, which matters
+    because this is a once-per-hop payment competing against per-step terms —
+    CLAUDE.md's "compare reward MASS, not weights". It also means a policy that
+    instantly re-launches collects only part of the annuity, which is mild
+    pressure toward hop-and-settle over continuous bouncing: the exact
+    behaviour this term exists to fix. Same window LENGTH as
+    ``hop_landing_quality`` so the two describe one event — but driven by this
+    term's own latch rather than by re-reading the contact sensor, because a
+    distance may be collected only by the landing that earned it (step 1b of
+    the update).
+
+    NOT a jackpot: the distance is clamped at ``disp_cap``, so a dive earns no
+    more than a good hop, and the payment happens once per flight rather than
+    accumulating while airborne.
+
+    Backward travel pays zero, never negative — a positive-weight term that can
+    return negative breaks the sign invariant CLAUDE.md calls infallible.
+
+    The tilt gate (not a height gate) is what stops a face-planting long hop
+    from outscoring a short clean one: at touchdown the trunk is legitimately
+    compressed, so height is the wrong screen, while a fallen robot is exactly
+    what tilt catches. Posture beyond upright-or-not is priced separately by
+    ``hop_landing_quality``, ADDITIVELY — multiplying the two would collapse
+    this term's gradient to nothing whenever landing quality is poor, which is
+    precisely when the policy most needs a reason to keep hopping.
+
+    ``disp_cap`` is derived, and must be re-derived, exactly like
+    ``FORWARD_VEL_CAP`` — which the S5 run saturated at ~95%, at which point a
+    metric can no longer tell good from great. See the cfg constant.
+    """
+    disp = _update_hop_displacement(env, sensor_name, min_flight_s, asset_cfg)
+    progress = disp.clamp(min=0.0, max=disp_cap) / max(disp_cap, 1e-6)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    cos_tilt = torch.nan_to_num(
+        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
+    )
+    upright = cos_tilt > math.cos(math.radians(max_tilt_deg))
+
+    # The latch's own window, not _hop_just_landed's sensor view — see step 1b
+    # of the update for the single-foot-flicker farm that distinction blocks.
+    landed = env._hop_since_land <= landing_window_s
+    settled = env.episode_length_buf > settle_steps
+    return progress * (landed & settled & upright).float()

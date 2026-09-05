@@ -70,7 +70,60 @@ job.** Run `s5-forward-hop` (job `6a9bf2e6259f8e97255e28a5`), `Mjlab-HopForward-
 - **Keep this policy as the "bunny hop" artifact.** It is the first thing this project trained that
   visibly does the thing.
 
-### The two changes that define the next run
+### The two changes that define the next run — NOW IMPLEMENTED (2026-09-05, session 4)
+
+Both are built and locked in by tests (278 CPU tests, ~14 s). `Mjlab-HopForward-Flat-MicroDuck`
+evolved **in place** — the hop-in-place baseline is still the untouched A/B reference, and the S5
+recipe stays reproducible from git plus its wandb run, so a third variant would have been a flag
+matrix for nothing. What shipped:
+
+- **`hop_displacement`** (`mdp.py`) — forward distance from takeoff to touchdown, paid across the
+  landing window, capped at 10 cm, measured along the **takeoff heading** so a turn-and-drift scores
+  nothing. It carries a takeoff latch (this repo's first stateful hop term; it follows roulade's state
+  idiom and is reset-aware inline like `head_pose_bias_penalty`'s EMA).
+- **The handover is a curriculum, not a swap.** `simultaneous_flight` 5.0 → 3.0 → 2.0 while
+  `hop_displacement` 0 → 5.0 → 10.0, sharing a boundary at iter 300. Displacement is unearnable until
+  flight exists, so it must not lead before then — and flight must not be demoted before then either.
+- **`forward_flight_progress`** — cap 0.4 → **0.8 m/s** (it was saturated at ~95%), weight 1.5 → 0.5.
+  It pays per airborne step, which is the shape displacement replaces, so it is now a ramp, not a driver.
+- **Head priced at touchdown**: a head-upright factor inside `hop_landing_quality` (std 0.35,
+  deliberately wide), the term raised 1.0 → 2.0, and `head_pose_bias` returning on a late gentle ramp
+  (0.5/1.0 at iters 800/1200 vs the walker's 1.0/2.0/3.0). `head_pose_tracking` untouched.
+
+**Two things a CPU test cannot prove, and this machine cannot run:** the env has NOT been built or
+stepped (no CUDA here), so the mandatory **64-env / 5-iteration smoke test is still owed** before any
+real run:
+
+```bash
+# SMOKE TEST — cents, ~minutes. Never launch the real run without it.
+# PYTHONIOENCODING is mandatory on Windows: without it the log streamer (and
+# even `train --help`) dies on non-ASCII with a charmap codec error.
+PYTHONIOENCODING=utf-8 uv run train Mjlab-HopForward-Flat-MicroDuck \
+    --env.scene.num-envs 64 --agent.max_iterations 5 --hf-jobs
+
+# THEN the real run (~1500 iters, ~$5-10 on l4x1):
+PYTHONIOENCODING=utf-8 uv run train Mjlab-HopForward-Flat-MicroDuck \
+    --env.scene.num-envs 4096 --agent.max_iterations 1500 --hf-jobs --video
+```
+
+The smoke test only proves it builds, steps NaN-free, all terms compute and ONNX exports — 5
+iterations show no behaviour. In the **real** run, watch three things:
+
+- **`Episode_Reward/hop_displacement` must go non-zero after iter 300** (when the curriculum hands it
+  the lead). A sparse, latched, gated term is exactly the kind that logs a silent `0.0000` — the trap
+  `forward_flight_progress` sat in through all of S5's smoke tests. If it is still exactly 0, the gate
+  is unreachable and the term needs LOOSENING, not tuning.
+- **`Episode_Reward/simultaneous_flight` should fall well below half its S5 value** (2.58). If the
+  airborne fraction stays ~50%, the handover did not take.
+- Every penalty term ≤ 0, throughout.
+
+**One judgment call worth re-examining before spending:** `HOP_DISP_WEIGHT = 10.0` is sized by reward
+MASS, not by the face value of the terms around it — a once-per-hop payment against per-step
+competitors. The derivation (a hop used to earn ~30 from air time; it now earns ~32 from a 45 mm
+displacement) is in the cfg constant's comment. If the smoke test shows the term dominating or
+vanishing, that constant is the dial.
+
+### The two changes, as originally diagnosed
 
 **1. Stop rewarding "airborne" as the accomplishment (user's call, and the data agrees).**
 `simultaneous_flight` pays **1.0 per step** while airborne, so air time IS the objective — and the
@@ -115,8 +168,9 @@ only tell was a physically impossible 0.0 mm apex rise. **Trust the impossible n
 
 ### Known-stale / loose ends
 
-- The detailed S5 implementation plan lives at `.claude/plans/s5-forward-hop-and-landing-quality.md`,
-  which is **gitignored** (`.gitignore:44`). Every other planning doc is tracked. Move it or un-ignore it.
+- ~~The detailed S5 implementation plan is gitignored.~~ **DONE** — it is tracked at
+  [`plans/s5-forward-hop-and-landing-quality.md`](./plans/s5-forward-hop-and-landing-quality.md).
+  A stale duplicate still sits in the ignored `.claude/plans/`; delete it.
 - [`tickets/microduck-hopscotch-phase-0.md`](./tickets/microduck-hopscotch-phase-0.md) still frames MD-3
   around the **closed** S1 question. Phase 1 is still unsliced — now slice it against
   [`hopscotch-routine.md`](./hopscotch-routine.md).
