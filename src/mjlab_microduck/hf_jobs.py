@@ -326,6 +326,15 @@ def submit(argv: list[str]) -> int:
     env: dict[str, str] = {
         "CKPT_REPO": ckpt_repo,
         "TRAIN_ARGS": " ".join(shlex.quote(a) for a in [args.task, *train_args]),
+        # Headless GPU rendering. --video makes mjlab build an offscreen
+        # renderer, and the job container has no display: without this MuJoCo
+        # tries GLFW/X11, fails to load Xlib, and dies at env construction with
+        # "an OpenGL platform library has not been loaded into this process" —
+        # BEFORE a single training step (job 6a9b732a, 2026-09-04). EGL renders
+        # on the GPU already present for training and needs no X server.
+        # Harmless when --video is off: nothing constructs a renderer.
+        "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl"),
+        "PYOPENGL_PLATFORM": os.environ.get("PYOPENGL_PLATFORM", "egl"),
     }
     secrets: dict[str, str] = {"HF_TOKEN": token}
 
