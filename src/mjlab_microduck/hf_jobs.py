@@ -113,8 +113,14 @@ if [ "$TRAIN_RC" -eq 0 ] && [ "${AUTO_EXPORT:-1}" = "1" ]; then
     CKPT=$(ls -t logs/rsl_rl/*/model_*.pt logs/rsl_rl/*/*/model_*.pt 2>/dev/null | head -1)
     if [ -n "$CKPT" ]; then
         echo "[bootstrap] auto-exporting ONNX from $(basename "$CKPT")"
+        # Pass the FULL path, not the basename: export.py treats
+        # --checkpoint-file as a literal path relative to CWD (/work) and
+        # derives log_dir from its parent, while the checkpoint actually lives
+        # in logs/rsl_rl/<experiment>/<run>/. Passing the basename made every
+        # auto-export die with "Checkpoint file not found: model_N.pt" — which
+        # is why runs before 2026-09-05 had to be exported by hand afterwards.
         uv run python scripts/export.py "$TASK_ID" \
-            --checkpoint-file "$(basename "$CKPT")" \
+            --checkpoint-file "$CKPT" \
             --num-envs 1 --onnx-file /work/policy.onnx \
         && uv run python - <<'PY'
 import os

@@ -152,7 +152,11 @@ records that tightening it made the policy stop moving entirely. The right tools
   rise, landing tilt, upright rate, consecutive streaks, S5 verdict.
 - `scripts/hopscotch/training_montage.py` — stitches a run's clips into one labelled progression video.
 - `scripts/hopscotch/flight_probe.py --view` — watch the best open-loop hop in slow motion.
-- `scripts/export.py` **works on CPU** — no GPU needed to export a checkpoint.
+- `scripts/export.py` **works on CPU** — no GPU needed to export a checkpoint. And as of session 4 the
+  **in-job auto-export works too**, so a finished run leaves `exported/policy.onnx` in its own Hub repo
+  and no longer has to be exported by hand: the bootstrap was passing `basename "$CKPT"` where
+  `export.py` wants a full path, so every auto-export had been dying with
+  `Checkpoint file not found: model_N.pt`.
 
 ### ⚠ Do NOT trust the eval battery's FORWARD verdict
 
