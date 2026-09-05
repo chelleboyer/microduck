@@ -64,6 +64,20 @@ mkdir -p /work && cd /work
 echo "[bootstrap] extracting source $SRC_TARBALL"
 tar -xzf "/src/$SRC_TARBALL"
 
+# Software GL, only when the run records video (MUJOCO_GL is set by the
+# submitter in that case). The stock runtime image has no GL driver of any
+# kind: GLFW dies on missing Xlib, and EGL dies even harder — PyOpenGL binds
+# nothing and `import mujoco` itself raises "'NoneType' object has no
+# attribute 'eglQueryString'". libosmesa6 is the one backend that needs no
+# display and no vendor driver.
+if [ "${MUJOCO_GL:-}" = "osmesa" ]; then
+    echo "[bootstrap] installing osmesa for offscreen video rendering"
+    apt-get update -qq >/dev/null 2>&1 && \
+    apt-get install -y -qq libosmesa6 libosmesa6-dev >/dev/null 2>&1 && \
+    echo "[bootstrap] osmesa installed" || \
+    echo "[bootstrap] WARNING: osmesa install failed — video will not render"
+fi
+
 echo "[bootstrap] uv sync"
 # Self-heal a poisoned persistent cache: a bad entry fails sync
 # deterministically, so nuke the cache and rebuild it once before giving up.
@@ -141,6 +155,22 @@ def _wandb_api_key() -> str | None:
         except (FileNotFoundError, OSError, NetrcParseError):
             continue
     return None
+
+
+def _wants_video(train_args: list[str]) -> bool:
+    """Is this run recording video? (`--video True`, or a bare `--video`.)
+
+    Gates the software-GL setup, which must NOT apply to ordinary runs: forcing
+    a GL backend the container cannot provide breaks `import mujoco` outright,
+    which would fail every job rather than just the video ones.
+    """
+    for i, a in enumerate(train_args):
+        if a == "--video":
+            nxt = train_args[i + 1] if i + 1 < len(train_args) else ""
+            return nxt.lower() not in ("false", "0", "no")
+        if a.lower().startswith("--video=") or a.lower().startswith("--video "):
+            return not a.lower().split("=", 1)[-1].startswith(("false", "0", "no"))
+    return False
 
 
 def _repo_root() -> Path:
@@ -326,15 +356,27 @@ def submit(argv: list[str]) -> int:
     env: dict[str, str] = {
         "CKPT_REPO": ckpt_repo,
         "TRAIN_ARGS": " ".join(shlex.quote(a) for a in [args.task, *train_args]),
-        # Headless GPU rendering. --video makes mjlab build an offscreen
-        # renderer, and the job container has no display: without this MuJoCo
-        # tries GLFW/X11, fails to load Xlib, and dies at env construction with
-        # "an OpenGL platform library has not been loaded into this process" —
-        # BEFORE a single training step (job 6a9b732a, 2026-09-04). EGL renders
-        # on the GPU already present for training and needs no X server.
-        # Harmless when --video is off: nothing constructs a renderer.
-        "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl"),
-        "PYOPENGL_PLATFORM": os.environ.get("PYOPENGL_PLATFORM", "egl"),
+        # Headless rendering for --video. The job container has no display, so
+        # MuJoCo's default GLFW/X11 path dies at env construction with "an
+        # OpenGL platform library has not been loaded into this process"
+        # (job 6a9b732a).
+        #
+        # EGL is the natural fix — GPU rendering, no X server — but the
+        # pytorch/pytorch runtime image ships NO EGL vendor library, so
+        # PyOpenGL binds nothing and `import mujoco` itself explodes with
+        # "'NoneType' object has no attribute 'eglQueryString'" (job 6a9b7bad).
+        # That is strictly worse: it breaks EVERY job, video or not.
+        #
+        # osmesa is software rendering: slower, but it is the only backend that
+        # works in a stock runtime image with no driver install, and video is
+        # recorded on a tiny fraction of steps so the cost is irrelevant.
+        # Set ONLY when video is requested, so non-video jobs keep the stock
+        # import path entirely untouched.
+        **(
+            {"MUJOCO_GL": os.environ.get("MUJOCO_GL", "osmesa"),
+             "PYOPENGL_PLATFORM": os.environ.get("PYOPENGL_PLATFORM", "osmesa")}
+            if _wants_video(train_args) else {}
+        ),
     }
     secrets: dict[str, str] = {"HF_TOKEN": token}
 
