@@ -3,6 +3,15 @@
 Teach Pollen Robotics' Microduck to hop, then to hopscotch — trained in MuJoCo simulation on Hugging
 Face Jobs, ultimately deployed to the physical robot.
 
+## Scope (session 3, 2026-09-04)
+
+**Sim-only.** Getting hopscotch working in simulation is what matters right now. Physical deployment is
+**deferred, not dropped** — BAM, domain randomization and the backlash twins stay on, because they cost
+nothing to keep (already wired; the one known working Microduck hop was trained *with* them) and dropping
+them is a one-way door. What the scope change actually unlocks is that two hardware-justified switches are
+now ours to flip if we want them: mjlab's native `height_scan`, and promoting `base_lin_vel` from
+critic-only to the actor. Neither is flipped yet — see S6 in the architecture doc.
+
 ## Current state (2026-09-04, end of session 2)
 
 **The remote pipeline works end-to-end, and the hop env exists and is GPU-validated.**
@@ -20,10 +29,15 @@ Face Jobs, ultimately deployed to the physical robot.
 - **Prior art found:** someone has already trained a Microduck hop —
   [`prior-art-hop.md`](./prior-art-hop.md). **Read it before spending GPU on S1.**
 
-**Next action: re-scope S1 before running it.** The original question ("can this robot leave the
-ground") is substantially answered by the prior art, so a ~$5 run to re-ask it buys little. The open
-question is whether a hop can be **commanded and repeatable** through the 13D block rather than a
-one-shot episodic trick. Decide that, then run.
+**S1 was re-scoped in session 3 and is now CLOSED without spending** — the prior art plus the CPU probe
+answer "can it leave the ground" in the affirmative for sim. **Next action: S5 — can it hop *forward* and
+land upright?** That is the brief's Success #1, and the prior art explicitly does not answer it (vertical
+hop only, from a standing entry). Forward intent is encoded as un-commanded forward progress while
+airborne (E1); commanded hop distance (E3) comes in Phase 1. Budget 2-3 runs, then re-plan. Full rationale
+and decision rule in [`../microduck-hopscotch-architecture.md`](../microduck-hopscotch-architecture.md).
+
+The gap to close before that run: **landing quality is unmeasured.** Every gate in the hop env checks the
+robot *during* flight (tilt, trunk height), so a forward hop that reliably face-plants scores well today.
 
 Two small Windows fixes in `hf_jobs.py` are known and unmade: the log streamer dies on non-ASCII
 output unless `PYTHONIOENCODING=utf-8` is set (the job itself is unaffected, but the local command
@@ -47,12 +61,18 @@ the key came from `_netrc`.
 
 ## Constraints that are expensive to rediscover
 
-**The duck is blind.** All Microduck policies share a fixed **61-dimensional** observation: 48
-proprioception + a 13D command block `[twist(3), head_pose(4), body_pose(6)]`. No vision, no height
-scan, no terrain sensing. Microduck *cannot see a course*. Hopscotch is therefore **choreography** — a
-sequence of commands over flat ground — not perception. Designs where the robot reads its environment
-are unreachable on real hardware. Never delete a command slot; unused slots are zero-padded to keep
-input neurons alive.
+**The duck is blind — by choice, not by nature.** All Microduck policies share a fixed **61-dimensional**
+observation: 48 proprioception + a 13D command block `[twist(3), head_pose(4), body_pose(6)]`. No vision,
+no height scan, no terrain sensing. So hopscotch is **choreography** — a sequence of commands over flat
+ground — not perception. Never delete a command slot; unused slots are zero-padded to keep input neurons
+alive.
+
+The nuance that matters under the sim-only scope: this is a *deferred decision*, not a physical limit.
+mjlab 1.3.0 ships a `height_scan` terrain ray-scan by default and `microduck_velocity_env_cfg.py:533-537`
+deletes it from both groups, because *the real robot has no such sensor*. We stay at 61D because it costs
+nothing until the duck needs to aim at a cell — not because perception is impossible. Breaking the
+contract is a real decision with real costs (policies stop being hot-swappable, hardware becomes a
+rewrite); it just isn't a closed one.
 
 **Hybrid, not all-remote.** Only *training* needs CUDA. Verified 2026-09-04 on Windows without a GPU:
 `uv sync` succeeds, upstream's 149 CPU config tests pass in 55 s, and CPU MuJoCo loads the real model —
@@ -77,11 +97,14 @@ contact-loss is not flight (a duck falling over loses both contacts and logs gre
 `current_air_time` is *per-foot* (a normal walk reports 125–300 ms). Simultaneous flight is
 `n_contact == 0`, gated on tilt and trunk rise.
 
-**The open project risk is physics.** No existing Microduck task has a flight phase. It is genuinely
-unknown whether an ~800g biped on compliant, backlash-heavy XL330 servos can leave the ground. MD-3
-answers this for ~$5. A negative result is a *successful* spike — it pivots hopscotch from jumping to
-stepping into cells, and reshapes roughly a third of the remaining backlog. **Phase 1 is deliberately
-unsliced until MD-3 reports.**
+**The open project risk is physics — now the *forward* half of it.** Whether an ~800 g biped on
+compliant, backlash-heavy XL330 servos can leave the ground is answered (prior art + probe). Whether it
+can travel while airborne and land upright is not. A negative result on S5 is a *successful* spike — it
+pivots hopscotch from jumping to stepping into cells, and reshapes roughly a third of the remaining
+backlog. **Phase 1 is deliberately unsliced until S5 reports.**
+
+**The course is a free variable.** With no physical course to match, cell size is ours to choose. Measure
+the hop distance the policy achieves, then size the cells to it — never the other way round.
 
 ## Working conventions
 

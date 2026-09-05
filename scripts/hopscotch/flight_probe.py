@@ -25,16 +25,19 @@ exactly what a hop needs. It also has no backlash and no domain randomization.
 Usage:
     uv run python scripts/hopscotch/flight_probe.py            # grid search
     uv run python scripts/hopscotch/flight_probe.py --csv out.csv   # + best trace
+    uv run python scripts/hopscotch/flight_probe.py --view          # WATCH the best hop
 """
 
 from __future__ import annotations
 
 import argparse
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import mujoco
+import mujoco.viewer
 import numpy as np
 
 SCENE = Path("src/mjlab_microduck/robot/microduck/scene_walk.xml")
@@ -173,6 +176,21 @@ def _ctrl_at(stand: np.ndarray, s: float, pattern: dict[int, float]) -> np.ndarr
     return ctrl
 
 
+def _sync(viewer, dt: float, speed: float) -> None:
+    """Push a frame to the viewer and pace it to wall clock.
+
+    ``speed`` is the playback rate: 1.0 is real time, 0.1 runs ten times
+    slower. Slow motion is not a nicety here — the flight phase this probe
+    measures is ~34 ms, which is two or three frames at real time and simply
+    cannot be seen.
+    """
+    if viewer is None:
+        return
+    viewer.sync()
+    if speed > 0.0:
+        time.sleep(dt / speed)
+
+
 def simulate(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -186,6 +204,8 @@ def simulate(
     t_settle: float = 0.6,
     t_observe: float = 0.9,
     trace: list | None = None,
+    viewer=None,
+    speed: float = 1.0,
 ) -> Result:
     left, right = _foot_geoms(model)
     dt = model.opt.timestep
@@ -199,6 +219,7 @@ def simulate(
     for _ in range(int(t_settle / dt)):
         data.ctrl[:] = stand_ctrl
         mujoco.mj_step(model, data)
+        _sync(viewer, dt, speed)
     z0 = float(data.qpos[2])
 
     total = t_crouch + t_extend + t_observe
@@ -223,6 +244,9 @@ def simulate(
 
         data.ctrl[:] = _ctrl_at(stand_ctrl, s, pattern)
         mujoco.mj_step(model, data)
+        _sync(viewer, dt, speed)
+        if viewer is not None and not viewer.is_running():
+            break
 
         n_down = _n_feet_down(data, left, right)
         z = float(data.qpos[2])
@@ -264,6 +288,11 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=10, help="how many results to print")
     ap.add_argument("--kp", type=float, default=20.0, help="probe position gain (Nm/rad)")
     ap.add_argument("--kd", type=float, default=0.3, help="probe damping gain")
+    ap.add_argument("--view", action="store_true",
+                    help="replay the best hop in the MuJoCo viewer, looping until the window is closed")
+    ap.add_argument("--speed", type=float, default=0.1,
+                    help="viewer playback rate (default 0.1 = 10x slower than real time; "
+                         "the flight phase is ~34 ms and is invisible at 1.0)")
     args = ap.parse_args()
 
     model = mujoco.MjModel.from_xml_path(str(SCENE))
@@ -364,6 +393,26 @@ def main() -> None:
             for row in trace:
                 fh.write("%.4f,%.4f,%d,%.5f,%.2f\n" % row)
         print(f"\nbest-run trace -> {args.csv} ({len(trace)} steps)")
+
+    if args.view:
+        show = best
+        if show is None:
+            show = topples[0] if topples else max(results, key=lambda r: r.apex_rise_m)
+            print("\n(no genuine hop in this sweep — replaying the best contact-loss run "
+                  "instead, which is a topple, not a hop)")
+        print(f"\nviewer: crouch={show.s_crouch:+.2f}/{show.t_crouch:.2f}s  "
+              f"extend={show.s_extend:+.2f}/{show.t_extend:.2f}s  ->  "
+              f"{show.flight_s * 1e3:.0f} ms flight, {show.apex_rise_m * 1e3:.1f} mm rise, "
+              f"max tilt {show.max_tilt_deg:.1f} deg")
+        print(f"playback {args.speed:g}x real time; the sequence is "
+              f"settle -> crouch -> extend -> observe, looping. close the window to exit.")
+        print("watch the FEET, not the trunk: the rise is millimetres, the tell is both "
+              "soles leaving the floor together.")
+        with mujoco.viewer.launch_passive(model, data) as v:
+            while v.is_running():
+                simulate(model, data, stand_ctrl, stand_qpos, pattern,
+                         show.s_crouch, show.s_extend, show.t_crouch, show.t_extend,
+                         viewer=v, speed=args.speed)
 
 
 if __name__ == "__main__":

@@ -1,250 +1,337 @@
 # Architecture — Microduck Hopscotch
 
 > Intent: [microduck-hopscotch-project-brief.md](./microduck-hopscotch-project-brief.md)
+> Fork rules & current state: [docs/hopscotch-rules.md](./docs/hopscotch-rules.md)
 > Tickets: [docs/tickets/microduck-hopscotch-phase-0.md](./docs/tickets/microduck-hopscotch-phase-0.md) (Phase 0 only)
-> Status: decided 2026-09-04. Pre-implementation. No code written yet.
+> Status: decided 2026-09-04. **Revised 2026-09-04 (session 3)** — scope narrowed to sim-only, S1 closed
+> and superseded by S5. Revision history at the end.
 
 ## Problem & goals
 
-Teach Pollen Robotics' Microduck to perform hopscotch — starting in MuJoCo simulation and ending on
-the physical robot. The first milestone is deliberately modest: **Microduck intentionally hops forward
-and lands upright.** Accurate landings, consecutive hops, and the full pattern build from there.
-Training runs on Hugging Face Jobs because the development machine has no GPU.
+Teach Pollen Robotics' Microduck to perform hopscotch in MuJoCo simulation. The first milestone is
+deliberately modest: **Microduck intentionally hops forward and lands upright.** Accurate landings,
+consecutive hops, and the full pattern build from there. Training runs on Hugging Face Jobs because the
+development machine has no GPU.
 
-Every decision below is judged against that first milestone, and against the constraint that whatever
-we train must eventually run on real hardware.
+**Scope, as of session 3: sim-only.** Getting this working in simulation is what matters right now.
+Physical deployment is **deferred, not abandoned** — see the scope decision below for exactly what that
+does and does not change. Every decision here is judged against the first milestone, and against
+keeping the hardware path cheap to resume rather than cheap to walk away from.
 
 ## What already exists (and reframes the work)
 
 The brief assumes more greenfield than there is. [`pollen-robotics/microduck_rl`](https://github.com/pollen-robotics/microduck_rl)
-(Apache 2.0) already provides:
+(Apache 2.0), merged into this repo and pinned at `1e79c29`, already provides:
 
 - **14 task families** on mjlab (MuJoCo Warp) + rsl_rl PPO — velocity, velstand, standup, sitstand,
   roulade, ballkick, groundpick, spin, roller and swizzle variants. Each has a `-Backlash-` twin.
-- **A working HF Jobs path.** `--hf-jobs` on the train command. Default flavor `l4x1`, 12h timeout,
-  a background uploader pushing `.pt` checkpoints to a private Hub repo every 60s, wandb credentials
-  forwarded as a secret. Their own docs state `uv sync` is ground truth *because* HF Jobs runs it.
-- **A sim2real stack** — BAM M6 actuator model for the Dynamixel XL330 (voltage law, back-EMF,
-  load-dependent friction), domain randomization over battery voltage, sag, command delay and friction,
-  IMU misalignment, encoder bias, backlash twins, NaN guards.
-- **`CLAUDE.md`** (repo root, post-merge) — a distilled reward-design and sim2real playbook encoding
-  months of hard-won lessons. Every reference to "`CLAUDE.md`" below means this upstream file; our own
-  fork rules live in `docs/hopscotch-rules.md`.
+- **A working HF Jobs path**, proven end-to-end on our account (S2 below).
+- **A sim2real stack** — BAM M6 actuator model for the Dynamixel XL330, domain randomization over
+  battery voltage, sag, command delay and friction, IMU misalignment, encoder bias, backlash twins,
+  NaN guards.
+- **`CLAUDE.md`** (repo root) — a distilled reward-design and sim2real playbook encoding months of
+  hard-won lessons. Every reference to "`CLAUDE.md`" below means this upstream file.
 - **An export/publish path** — ONNX with the observation normalizer baked in, schema-2 manifest, Hub upload.
+- **A hop environment** — `Mjlab-Hop-Flat-MicroDuck` and its `-Backlash-` twin, built during MD-3.
 
 Two consequences:
 
-1. **The HF Jobs milestone shrinks from a build to a smoke test.** The brief's "prove HF Jobs can run
-   normal training first" is still the right first move, but it is hours of verification, not weeks of
-   pipeline work.
-2. **The risk moves to physics and perception**, not compute. See Spikes.
+1. **The HF Jobs milestone was a smoke test, not a build.** Resolved; see S2.
+2. **The risk was never compute.** It is physics, and now behaviour design.
 
-### The binding constraint: the duck is blind
+### Three properties of the inherited stack that drive the decisions below
 
-All Microduck policies share a fixed **61-dimensional observation**: 48 proprioception + a 13D command
-block `[twist(3), head_pose(4), body_pose(6)]`. There is **no exteroception** — no vision, no height
-scan, no terrain sensing. Policies are hot-swapped at runtime behind this shared contract, so slots are
-never deleted, and unused slots are zero-padded with tiny sampling ranges to keep input neurons alive.
+**1. The 61D observation contract.** All Microduck policies share a fixed **61-dimensional**
+observation: 48 proprioception + a 13D command block `[twist(3), head_pose(4), body_pose(6)]`. Policies
+are hot-swapped at runtime behind this shared contract, so slots are never deleted, and unused slots are
+zero-padded with tiny sampling ranges to keep input neurons alive. Semantics fully documented in
+[`docs/command-block.md`](./docs/command-block.md).
 
-**Microduck cannot see a hopscotch course.** Any design where the robot perceives and navigates cells
-is outside the existing contract. Hopscotch must therefore be expressed as *commanded* motion — the
-course lives in whatever drives the commands, not in the robot's senses.
+**2. Exteroception is available in the framework, and was switched off deliberately.** mjlab 1.3.0 ships
+a `height_scan` terrain ray-scan observation by default. `microduck_velocity_env_cfg.py:533-537` deletes
+it from *both* the actor and critic groups, with the reason stated in the comment: *"The microduck has no
+such body-mounted terrain sensor for the policy."* Terrain geometry is likewise a solved pattern —
+`slope_terrain.py` builds difficulty-scaled boxes wired to a curriculum, which is the same shape a
+hopscotch course needs.
+
+**3. The stack is already asymmetric actor-critic, split on the hardware line.** `base_lin_vel` is
+provided to the critic only, as privileged information (`microduck_velocity_env_cfg.py:539-543`). The
+word *privileged* means "the real robot cannot measure this." In a sim-only project that distinction
+carries no weight: anything the critic sees, the actor could see too.
+
+Properties 2 and 3 exist because of hardware. They are the levers the scope change unlocks, and the
+reason approach B below is no longer dead.
 
 ## Approaches considered
 
-**A. Commanded hop-gait on flat ground, inside the 61D contract** *(recommended)*
-Hopping becomes a gait mode in a velocity-derived environment, driven through the existing command
-block. No physical course in simulation; the course is painted visual markers and a sequence of
-commands issued by the runtime.
-*For:* stays inside the observation contract, so policies remain hot-swappable and publishable; inherits
-the full DR / obs-noise / delay / NaN-guard stack automatically; matches how the real robot is actually
-driven; cheapest path to Success #1.
+**A. Commanded hop-gait on flat ground, inside the 61D contract** *(chosen — see Recommended approach)*
+Hopping is a gait mode in a velocity-derived environment, driven through the existing command block. No
+physical course in simulation; the course is painted markers plus a sequence of commands.
+*For:* stays inside the observation contract, so policies remain hot-swappable and the hardware path stays
+open for free; inherits the full DR / obs-noise / delay / NaN-guard stack automatically; cheapest path to
+Success #1; the environment already exists and is GPU-validated.
 *Against:* not "true" autonomous hopscotch — the duck executes a choreography rather than reading a
-course. Landing accuracy is open-loop, bounded by command-tracking precision.
+course. Landing accuracy is open-loop and, without a course to measure against, not directly verifiable.
 
-**B. Physical course geometry + extended observations**
-Build real cell geometry (box primitives, the way `slope_terrain.py` builds ramps, with difficulty
-scaling for curriculum), and add cell-relative position observations so the duck can aim.
-*For:* the most literal and most capable hopscotch; genuine closed-loop foot placement.
-*Against:* breaks the 61D contract, so policies stop being hot-swappable in the runtime. Worse, it
-requires a real-world position source the robot does not have — there is no path to deploy it on
-hardware without adding localization that doesn't exist. Sim-only result.
+**B. Physical course geometry + extended observations** *(rejected in session 1 on a reason that no
+longer holds; now a live deferred option)*
+Build real cell geometry and give the actor course-relative observations so the duck can aim.
+*For:* the most literal reading of the brief, which asks in as many words to *"create a simulated
+hopscotch course"* and to *"progress through the course"*; genuine closed-loop foot placement; landing
+accuracy becomes a measurable, trainable objective instead of open-loop hope. Cheaper to build than
+session 1 assumed — `height_scan` is native to mjlab and is two deleted lines away, and `slope_terrain.py`
+is a working template for the course geometry.
+*Against:* **the original objection is void.** It was rejected because it "requires a real-world position
+source the robot does not have… no path to deploy on hardware," which is not a defect in a sim-only
+project. What remains against it is real but ordinary: it breaks the 61D contract, so policies stop being
+hot-swappable and the hardware path becomes a rewrite rather than a port; and it is a substantially larger
+learning problem (perception + locomotion + hopping at once), meaning more iterations and more money.
 
-**C. Episodic trick library + daemon choreography**
-Train each hop type as a separate short episodic policy (like roulade / groundpick), and let the daemon
-sequence them into a routine.
-*For:* each policy is simple and independently verifiable; matches the existing episodic-trick pattern.
-*Against:* stitching independent episodic policies into a continuous rhythm is brittle at the seams;
-pays for the same discovery work repeatedly; clashes with the velocity template.
+**C. Episodic trick library + scripted choreography** *(not chosen; strengthened, and now the fallback)*
+Train each hop type as a separate short episodic policy (like roulade / groundpick) and sequence them.
+*For:* **this is the shape of the one known working Microduck hop** ([`docs/prior-art-hop.md`](./docs/prior-art-hop.md)) —
+evidence, not argument. Each policy is simple and independently verifiable. Its main recorded weakness —
+"stitching independent episodic policies into a continuous rhythm is brittle at the seams" — is largely a
+*runtime* problem, and sim-only softens it a lot: in simulation the sequencer is a script with perfect
+switch timing that can guarantee the stable standing entry the prior-art policy requires.
+*Against:* pays the discovery cost once per hop type, at $15-30 a run; no rhythm, so consecutive hops need
+explicit work rather than coming free; the seams remain physically visible even when the switch is perfect
+(the prior-art hop needs ~1 s of settling before it will fire).
 
 ## Recommended approach
 
-**Fork `microduck_rl`; add a velocity-derived hop-gait task; keep the duck on flat ground and inside
-the 61D contract; run everything on HF Jobs.**
+**Prove the forward hop inside the 61D contract first; keep every other door open.**
 
-Hopping is modelled as a *continuous gait mode* rather than a one-shot trick. A rhythm is
-self-reinforcing and easier for PPO to discover than an isolated jump, consecutive hops come free
-rather than needing rework, and a single hop is simply the one-cycle case. Because the command stays
-constant during execution, the resulting policy is publishable through the existing constant-command
-publish path.
+Concretely: extend the existing commanded-gait hop environment (approach A) until we know whether
+Microduck can hop *forward* and land upright. That question is a prerequisite for all three approaches —
+you cannot aim at a cell (B) or sequence hops into a routine (C) before a forward hop exists — so it is
+the one spend that cannot be wasted by a later change of direction.
 
-The hopscotch *course* is choreography: a sequence of commands issued to a hot-swappable policy, over
-flat ground with the course painted on it for the humans watching.
+Perception (B) is **deferred, not rejected**: re-decided at the aiming stage, once there is a hop to aim.
+The episodic library (C) is the **fallback** if the commanded gait proves hard to condition.
+
+The cost of this ordering is honest and small: if we later go to B, the forward-hop policy's *weights*
+don't transfer across an observation-dimension change. The environment, rewards, terrain, curriculum and
+evaluation all do. One ~$20 run is the price of not betting the project on an unproven motor skill.
 
 ## Key decisions
 
-**Stack & libraries** — Inherited wholesale, deliberately. Python + `uv`; mjlab (MuJoCo Warp) for
+**Scope — sim-only, hardware deferred not dropped.** *(session 3)* The question is what to stop paying
+for. Answer: **nothing, for now.** BAM, the backlash twins and domain randomization are kept.
+
+- **BAM** is not sim2real overhead, it is the model of this robot's actuators. Removing it does not make
+  the simulation easier to trust; it makes it a different robot.
+- **DR** is genuine sim2real tax and stripping it would speed convergence — but the one known working
+  Microduck hop was obtained *with* backlash, BAM, current saturation and DR, so DR is demonstrably not
+  what blocks a hop. Stripping it would buy a speedup we have no evidence we need, discard the only
+  conditions under which a hop is known to work, and lose comparability with the prior art.
+- **Backlash twins** are generated by `make_backlash_variant`, so maintaining them costs approximately
+  nothing. Kept and registered; not spent on.
+
+If training later stalls, a DR-off ablation is a cheap **diagnostic**, and is named here as a lever rather
+than adopted as a decision. **S4 (reality gap) is deferred, not deleted.**
+
+**Observation & command contract — stay at 61D for now, as a deferred decision.** The contract costs
+almost nothing today: hop intent already fits `body_pose[2]`, and the spike does not need to aim. It
+starts costing the moment we want closed-loop cell placement. Recorded explicitly so nobody mistakes it
+for a settled constraint: **two things become available the day we drop it** — mjlab's native
+`height_scan`, and promoting `base_lin_vel` from critic-only to the actor (a ballistic hop genuinely
+benefits from knowing its own linear velocity). Neither is taken now. Whichever slot carries a command
+must be non-zero from step 0 even at reward weight 0, or its input weights die permanently; and the
+all-zero command — the idle state — must be trained explicitly via exact-zero sampling.
+
+**Command encoding for forward intent — E1 now, E3 for Phase 1.** *(session 3)* Three encodings were
+weighed:
+
+- **E1 — un-commanded forward progress** *(chosen for the spike)*: reward forward base velocity **while
+  airborne**, capped, gated by the tilt and trunk-height screens the flight term already carries. Dense,
+  stateless, and structurally immune to the walking exploit because it pays nothing while a foot is down.
+- **E2 — forward velocity through the existing `twist.lin_vel_x`** *(rejected)*: the most natural "gait"
+  and it reuses the velocity env's tracking rewards, but velocity tracking has a strictly easier solution
+  than hopping — walking — and it is the solution the base environment is tuned to find. The hop env
+  crushed the twist ranges to ±0.05 and cut `air_time` 3.0 → 0.5 for exactly this reason: *"At 3.0 a good
+  stride out-earns any hop the robot can currently produce, so walking is simply the better policy."*
+  This repo has a second receipt for the same failure shape at
+  `microduck_velocity_env_cfg.py:729-737` — *"Standing still scored higher, so it stood still."*
+- **E3 — commanded hop distance in `body_pose[0]`** *(deferred to Phase 1)*: a per-hop displacement
+  target, latched takeoff → landing. The most hopscotch-shaped encoding, because cells are discrete
+  distances rather than velocities. Deferred because it asks the policy to learn the skill and its
+  command-conditioning simultaneously, and needs latching logic before any hop exists. **E3 is E1 plus
+  latching plus command gating**, so E1 is an increment toward it, not throwaway work. When E3 lands it
+  must *not* go through `body_pose_tracking`: commanding an x-offset and rewarding pose tracking rewards
+  leaning forward, the same trap already documented for the z slot.
+
+**The course is a free variable — size cells to the duck, not the duck to the cells.** *(session 3)*
+Session 1 listed "what does the real course look like?" as an open question, on the grounds that physical
+dimensions constrain achievable hop distances. Sim-only reverses the causality: there is no physical
+course, so cell size is ours to choose. Measure the hop distance the policy actually achieves, then size
+the course to it. This removes an entire class of "the hop isn't big enough" failure, and makes the
+forward-hop spike the thing that dimensions the course.
+
+**Stack & libraries — inherited wholesale, deliberately.** Python + `uv`; mjlab (MuJoCo Warp) for
 GPU-parallel simulation; rsl_rl PPO; wandb for run tracking; ONNX for export; Hugging Face Hub for
 artifacts and HF Jobs for compute. *Alternatives rejected:* MuJoCo Playground or a from-scratch Gymnasium
-env — both would discard the BAM actuator model and DR stack that make sim2real work here, which is the
-single hardest part of this problem and already solved upstream.
+env — both would discard the BAM actuator model and DR stack, which are the hardest part of this problem
+and already solved upstream. Unchanged by the scope narrowing: none of this was chosen *for* hardware.
 
-**Repo strategy** — Fork `microduck_rl` into this repo, upstream kept as a git remote to pull from.
-The `--hf-jobs`, export, publish and DR tooling all assume the repo layout, so an overlay package would
-have to port the full DR + obs-noise + NaN-guard stack (their CLAUDE.md warns about exactly this).
-Cost accepted: our work is entangled with theirs and merges need care. Upstream is young and moving
-fast, so we pin a known-good commit and pull deliberately, not continuously.
-
-**Task template** — Build on the velocity family (`make_microduck_velocity*_env_cfg`). CLAUDE.md
+**Task template — build on the velocity family** (`make_microduck_velocity*_env_cfg`). CLAUDE.md
 recommends this explicitly: it keeps domain randomization, observation noise, command delays and NaN
-guards in sync automatically. Roulade was the tempting alternative (the only existing explosive,
-ballistic template, with motion-blocker regularizers already tuned low) but it is episodic and has no
-locomotion command structure.
+guards in sync automatically. The existing hop env already does this, and enumerates its seven deliberate
+deviations from the walker in its module docstring. Roulade was the tempting alternative (the only
+existing explosive, ballistic template) but it is episodic and has no locomotion command structure.
 
-**Observation & command contract** — Stay at 61D. No new observation slots. The hop command is encoded
-by repurposing existing command-block capacity (candidate: a `body_pose` vertical component as commanded
-hop height). Exact slot semantics must be read from source after the fork — see Open questions. Per
-CLAUDE.md, whichever slot is chosen must be non-zero from step 0 even at reward weight 0, or its input
-weights die permanently; and the all-zero command (deployment idle) must be trained explicitly via
-exact-zero sampling rather than left to uniform sampling.
+**The core new rewards.** `simultaneous_flight` (binary, `n_contact == 0`, gated on tilt and trunk rise)
+and `bilateral_foot_clearance` (dense ramp, target 0.035 m) are **built and GPU-validated**. Each rejects
+the other's exploit: clearance can be farmed by tucking the feet while the trunk sags, which the flight
+term's contact condition rejects; flight can be reached by toppling, which clearance rejects because a
+falling duck's feet do not rise. CLAUDE.md's constraints continue to bind on anything added: no "reach X"
+jackpots, motion-blocker regularizers kept low because they penalize exactly what dynamic motion requires,
+smoothness penalties introduced only *after* the skill exists, and every penalty term logging ≤ 0 in wandb
+throughout — a check CLAUDE.md calls infallible for catching sign inversions.
 
-**The core new reward: simultaneous flight** — mjlab's velocity lineage ships `feet_air_time`, but that
-rewards *alternating* single-foot air time — ordinary walking. A hop requires **both feet off the ground
-at once**. This is a genuinely new reward term, not a reweighting, and it is the central piece of new
-work in the project. CLAUDE.md constrains its design: no "reach X" jackpots (use potential-based shaping,
-charging for progress deltas); keep motion-blocker regularizers (body angular velocity, angular momentum,
-pose std) *low*, because they penalize exactly what dynamic motion requires; introduce smoothness
-penalties (action rate, torque rate) only *after* the skill exists, via curriculum, or "do nothing" wins
-during exploration. All penalty terms must log ≤ 0 in wandb throughout — that check is infallible and
-catches sign inversions.
+**Compute & dev loop — hybrid, settled by S3.** Iterate locally on CPU (config tests, physics probes,
+reward signs — seconds, free, no GPU); submit only real training to HF Jobs. Measured job scheduling
+latency of 46 / 0 / 12 minutes across three submissions dominates wall-clock more than config errors do,
+which is what demoted the MD-2 preflight harness from load-bearing to optional.
 
-**Compute & dev loop** — All-remote on HF Jobs; no local GPU and no WSL2 setup. Mitigated by a
-**preflight-in-one-job** pattern: a single job runs CPU-runnable config tests → 64-env/5-iteration smoke
-test → full training, failing fast before the GPU section starts. CLAUDE.md reports the smoke test catches
-~95% of config errors, and `cpu-basic` is $0.01/hr, so a reward-sign typo dies in seconds rather than
-after hours of training. One cold start per iteration.
+**Budget posture — 2-3 runs, then re-plan.** *(session 3)* Default `l4x1` at $0.80/hr; the forward-hop
+spike is ~$5-10 a run. CLAUDE.md's expectation of 2-5 reward-hacking iterations before convergence is
+normal and expected, so a single run would likely land mid-tuning rather than at an answer. Three is
+enough to distinguish "untuned" from "wrong approach"; stopping there forces a checkpoint before the spend
+compounds. Early phase stays well under $150.
 
-**Budget posture** — Lean. Default `l4x1` at $0.80/hr. Flight-phase spike ~1000 iterations (~$3–5). A
-full hop gait is a curriculum-heavy gait, so CLAUDE.md's 4000–6000 iteration budget applies (~$15–30 per
-run), and 2–5 reward-hacking iterations before convergence is normal and expected. Early phase should
-land well under $150.
+**Data model.** Not a conventional data model; the durable shapes are the 61D observation contract above,
+and the artifact chain: wandb run → `.pt` checkpoint (auto-uploaded to a private Hub model repo during
+training) → ONNX with normalizer baked in → schema-2 manifest → Hub policy repo. Under sim-only the
+manifest's role as the hard contract with the robot's Rust runtime is dormant, but the export path is still
+the only correct way to produce a policy for playback and evaluation — never hand-convert a checkpoint, as
+in-sim play hides the bug by applying the normalizer anyway.
 
-**Data model** — Not a conventional data model; the durable shapes are the 61D observation contract
-described above, and the artifact chain: wandb run → `.pt` checkpoint (auto-uploaded to a private Hub
-model repo during training) → ONNX with normalizer baked in → schema-2 manifest → Hub policy repo →
-loaded by the on-robot daemon.
-
-**Boundaries & contracts** — `HF_TOKEN` as a job secret (with namespace controlling repos, uv-cache
-bucket and billing); wandb credentials forwarded from `~/.netrc` as a secret; the Hub as the artifact
-store; and the schema-2 policy manifest as the hard contract with the robot's Rust runtime. Never export
-a checkpoint by hand — the normalizer must be baked in by `scripts/export.py`, and in-sim play hides the
-bug because it applies the normalizer anyway.
+**Boundaries & contracts.** `HF_TOKEN` as a job secret, with the namespace (`chelleboyer`, personal, Pro
+active) governing repos, uv-cache bucket **and billing**; wandb credentials forwarded from `~/.netrc` as a
+secret; the Hub as the artifact store.
 
 ## Missing pieces
 
-- **A simultaneous-flight reward term** — the central new work (see above).
-- **A hop command encoding** — which slot carries hop intent, and its sampling distribution, including
-  explicit buckets for rare-but-important command regions (CLAUDE.md: turn-in-place spins emerged as ~2%
-  of experience under uniform sampling and never trained).
-- **A hop-gait environment config module** plus its registration and `-Backlash-` twin.
-- **Landing-quality criteria** — what counts as "upright" and "accurate", as measurable terminations and
-  reward gates rather than prose. CLAUDE.md warns to check *tilt*, not just height.
-- **A curriculum** from hop-in-place → forward hop → consecutive hops → sequence, with stage boundaries.
-- **A headless evaluation battery** — per-spawn-type outcomes, end-state clusters, air-time profiles —
-  to judge runs before touching rewards.
-- **The course choreography itself** — the command sequence that constitutes "hopscotch", and whatever
-  drives it at runtime.
-- **Painted course markers** for visual legibility in sim and on the floor.
+Built since session 1, no longer missing: the simultaneous-flight reward, the bilateral-clearance ramp,
+the hop environment and its `-Backlash-` twin, and the command-block semantics.
+
+Still missing, in dependency order:
+
+- **A forward-progress-while-airborne reward** (E1) — the spike's one new term.
+- **Landing-quality criteria** — *the required new work, and currently a hole.* Every gate in the hop env
+  measures the robot **during** flight (tilt, trunk height). "Lands upright" is unmeasured, so a forward
+  hop that reliably face-plants scores well today. CLAUDE.md is explicit that upright checks must measure
+  tilt, not just height.
+- **A curriculum** from hop-in-place → forward hop → consecutive hops, with stage boundaries phase-aligned
+  to what the policy has actually learned.
+- **A headless evaluation battery** — per-spawn-type outcomes, end-state clusters, air-time and
+  displacement profiles — to judge runs from evidence before changing rewards.
+- **The visual half of that battery — training video that survives the job.** CLAUDE.md is explicit that
+  *"sim metrics can pass while the video fails the human eye"*, so numbers alone cannot judge a run. The
+  dev machine reports `cuda available: False`, so nothing renders locally and `uv run play` cannot run
+  here at all — remote video is the only way to see a policy move. mjlab already records it
+  (`--video`, `--video-length`, `--video-interval`), but `scripts/hf/uploader.py` ships only
+  `model_*.pt` and `params/*`, so today those clips die with the container. A one-line glob closes it.
+- *(deferred, approach-dependent)* Course terrain geometry; course-relative observations; the choreography
+  itself; painted markers.
 
 ## Spikes & experiments
 
-**S1 — Can Microduck physically leave the ground?** *(blocking, do first)*
-No existing task has a flight phase; roulade is the most dynamic and a roll never needs ground clearance.
-Microduck is ~800g on low-torque, compliant, backlash-heavy XL330 servos. Whether a true flight phase is
-achievable at all is genuinely unknown, and it determines the shape of the entire project.
-
-**Update 2026-09-04 — CPU pre-check run, S1 still open.** A free open-loop probe
-([`docs/s1-flight-probe.md`](./docs/s1-flight-probe.md), `scripts/hopscotch/flight_probe.py`) found a
-best case of **~34 ms simultaneous flight, ~11 mm rise, landing upright** — the low end of the
-ambiguous band. Torque-saturated (so a real ceiling for open-loop), but optimistic (no BAM back-EMF,
-backlash or DR). A policy can still beat it: the head is 280 g of a 737 g robot and the probe holds it
-rigid. **Measure `n_contact == 0` gated on tilt and rise — per-foot `current_air_time` reports
-125-300 ms for an ordinary walk.**
-
-**Update 2026-09-04 (later) — PRIOR ART FOUND; S1 substantially answered, and re-scoped.**
-A community policy ([`docs/prior-art-hop.md`](./docs/prior-art-hop.md),
-`joanfox/microduck-happy-hop`) reports a complete two-foot hop — crouch, takeoff, landing absorption,
-stable recovery — trained under **backlash + BAM + current saturation + DR**, using bilateral foot
-clearance (0.035 m target) as its objective. Sim-only, never hardware-tested, self-reported. But it
-means the blocking question below is largely settled in the affirmative, and the ~$5 run should not be
-spent re-asking it. The live question is now whether a hop can be **commanded and repeatable** through
-the 13D block, since theirs is episodic with every command slot zeroed — i.e. it is evidence for
-approach **C**, which we rejected in favour of **A**. That choice is now contested by evidence rather
-than settled by argument.
+**S5 — Can Microduck hop forward and land upright?** *(open, blocking, do next)*
+The brief's Success #1, and the one question every approach depends on. Prior art does **not** answer it:
+its own model card reports a vertical hop from a standing entry and states it was *"not trained to take off
+directly from an active walking stride."*
 
 ```
-Question:      Can Microduck achieve a real flight phase (both feet off ground, measurable air time)?
-Spike:         Velocity-derived env, reward air-time + upright landing only, minimal regularizers.
-               ~1000 iters @ 4096 envs on l4x1. Roughly 2-4h, under $5.
-Decision rule: >80ms consistent air time with upright landing  -> true hop track, hopscotch as designed.
-               Ground contact never breaks / air time <30ms    -> pivot to "stepping" hopscotch
-                                                                  (foot placement into cells, no flight).
+Question:      Can Microduck hop forward and land upright?
+Spike:         Extend the hop env with forward-progress-while-airborne (E1) plus a
+               landing-quality term. ~1000-1500 iters @ 4096 envs on l4x1. ~$5-10/run,
+               2-3 runs before re-planning.
+Decision rule: >=5 cm net displacement per hop, landing upright, repeatable over >=3
+               consecutive hops  -> forward-hop track; size cells to the measured
+                                    distance; proceed to commanded distance (E3).
+               <1 cm, or upright landings <50%
+                                 -> the hop is vertical-only; hopscotch becomes
+                                    hop-in-place-into-cells, or the stepping pivot.
 ```
 
-**S2 — Does the stock pipeline run end-to-end on our HF account?** *(RESOLVED 2026-09-04: yes.
+The 5 cm threshold is a **placeholder pending measurement** against foot length and body height — it is
+asserted, not derived, and should be pinned down before the run is judged. Measure displacement between
+takeoff and landing, and measure uprightness by **tilt**, not height.
+
+**S6 — Is perception worth breaking the 61D contract for?** *(deferred; trigger: S5 passes)*
+Only meaningful once a forward hop exists. Give the actor course-relative observations (or mjlab's native
+`height_scan`) and compare cell-placement accuracy against the open-loop choreographed policy.
+Decision rule: if closed-loop placement is not materially more accurate than open-loop commands, stay at
+61D and keep the hardware path — the contract is only worth breaking if aiming actually buys accuracy.
+
+**S4 — Does a hop survive the reality gap?** *(deferred by the sim-only scope; not deleted)*
+Ballistic motion is far more sensitive to actuator fidelity, backlash and command delay than walking.
+Whenever hardware returns to scope: compare the base task against its `-Backlash-` twin, then rehearse via
+`scripts/infer_policy.py` before deploying. Keeping BAM, DR and the backlash twins on is what keeps this
+spike cheap to run later rather than a rebuild.
+
+**S1 — Can Microduck physically leave the ground?** *(CLOSED 2026-09-04, superseded by S5)*
+Answered in the affirmative for simulation, by two independent pieces of evidence, without spending the
+budgeted GPU run:
+
+- A free CPU open-loop probe ([`docs/s1-flight-probe.md`](./docs/s1-flight-probe.md)) found ~34 ms of
+  genuine simultaneous flight, ~11 mm rise, landing upright — torque-saturated, so a real ceiling for
+  open-loop, but optimistic (no BAM back-EMF, backlash or DR). It also caught two metric traps that would
+  each have cost GPU money: contact-loss is not flight (a toppling duck loses both contacts and logs
+  excellent "air time" — 384 apparent successes were topples), and `current_air_time` is *per-foot*
+  (an ordinary walk reports 125-300 ms and would read as a pass).
+- Prior art ([`docs/prior-art-hop.md`](./docs/prior-art-hop.md)) — a community policy reporting a complete
+  two-foot hop with crouch, takeoff, landing absorption and stable recovery, trained under backlash + BAM +
+  current saturation + DR. Sim-only, self-reported, never hardware-tested.
+
+**Decision recorded: do not spend the ~$5 re-asking "can it leave the ground."** It buys little. The
+budget moves to S5. Note that the prior art's upstream base `d424a0c` is not our pin `1e79c29`, and
+whether it is ahead of ours is unchecked — one `git log` against the `upstream` remote settles it.
+
+**S2 — Does the stock pipeline run end-to-end on our HF account?** *(RESOLVED 2026-09-04: yes.)*
 Namespace `chelleboyer`, Pro active. Stock velocity task submitted via `--hf-jobs`, ran to completion,
-`.pt` checkpoints landed in a private Hub model repo, wandb streamed live. The pipeline is trusted.
-Only the 12h timeout behaviour remains unobserved — see [`docs/upstream-pin.md`](./docs/upstream-pin.md).)*
-Cheap, and the brief already calls for it. Run stock `Mjlab-Velocity-Flat-MicroDuck` via `--hf-jobs`,
-confirm namespace/billing, checkpoint upload, wandb streaming, and the 12h timeout behaviour. Decision
-rule: if checkpoints land in the Hub repo and wandb streams, the pipeline is trusted and we never
-revisit it. Run before or alongside S1.
+`.pt` checkpoints landed in a private Hub model repo, wandb streamed live. The pipeline is trusted. Only
+the 12h timeout behaviour remains unobserved — see [`docs/upstream-pin.md`](./docs/upstream-pin.md).
 
-**S3 — Is the all-remote loop actually tolerable?** *(RESOLVED 2026-09-04: the loop is HYBRID, not
-all-remote. `uv sync` and upstream's 149 CPU config tests pass on Windows with no GPU, in 55 s. Iterate
-locally; submit only real training. This demotes MD-2 to an optimization.)*
-Our dev-loop choice is the one with real uncertainty. After ~5 preflight-pattern iterations, judge it.
-Decision rule: if config errors are reliably caught in the CPU preflight stage and turnaround is
-acceptable, stay all-remote. If we are repeatedly burning GPU minutes on errors a local test would have
-caught, revisit WSL2 + CPU-only tests.
-
-**S4 — Does a hop survive the reality gap?** *(defer until a hop exists)*
-Ballistic motion is far more sensitive to actuator fidelity, backlash and command delay than walking is.
-Before trusting any hop on hardware, compare the base task against its `-Backlash-` twin, then rehearse
-via `scripts/infer_policy.py` before deploying to the physical robot.
+**S3 — Is the all-remote loop tolerable?** *(RESOLVED 2026-09-04: the loop is HYBRID, not all-remote.)*
+`uv sync` and the full CPU test suite (199 tests) pass on Windows with no GPU in ~13 s. Iterate locally;
+submit only real training.
 
 ## Open questions
 
-- ~~**Exact command-block semantics.**~~ **RESOLVED 2026-09-04** — see
-  [`docs/command-block.md`](./docs/command-block.md). `body_pose` is `[x, y, z, roll, pitch, yaw]`,
-  a delta from nominal standing (`nominal_height=0.095`), and the velocity env carries the whole
-  6D block at **reward weight 0**. So the entire block is free. Hop intent goes in `body_pose[2]`,
-  and `body_pose_tracking` **stays at weight 0** — tracking a commanded height rewards standing tall,
-  which beats flight.
-- **Does the fork pin or track upstream?** Upstream is actively developed. Default is pin-and-pull-
-  deliberately; revisit if they ship something we want.
 - **Is "hopscotch" one policy or several?** A single commanded gait covering all hop types is cleanest,
-  but distinct hops (single-foot cell vs two-foot straddle) may need separate policies hot-swapped by the
-  daemon. Settled by how well one policy generalizes across hop types in training.
-- **What does the real course look like?** Physical dimensions of the floor course constrain achievable
-  hop distances, and should be measured against S1's results rather than assumed.
+  but distinct hops (single-foot cell vs two-foot straddle) may need separate policies sequenced by a
+  script. Settled by how well one policy generalizes across hop types in training — and note that the
+  prior art is evidence for the several-policies shape.
+- ~~**Exact command-block semantics.**~~ **RESOLVED** — [`docs/command-block.md`](./docs/command-block.md).
+  `body_pose` is `[x, y, z, roll, pitch, yaw]`, a delta from nominal standing, carried at reward weight 0
+  in the velocity env, so the whole 6D block is free. Hop intent goes in `body_pose[2]`, and
+  `body_pose_tracking` **stays at weight 0** — tracking a commanded height rewards standing tall, which
+  beats flight. A test asserts this.
+- ~~**What does the real course look like?**~~ **DISSOLVED by the sim-only scope** — the course is a free
+  variable, sized to the measured hop. See Key decisions.
+- **What is the right forward-hop distance threshold?** The 5 cm in S5 is a placeholder. Settled by
+  measuring foot length and body height against the achieved distance.
+- **`nominal_height = 0.095` does not match the model** (measured: trunk z 120.0 mm authored, 116.7 mm
+  settled). Harmless only while `body_pose_tracking` is at weight 0. Anyone raising that weight inherits a
+  ~22 mm error. Documented in [`docs/command-block.md`](./docs/command-block.md); re-measure before
+  trusting it.
+- **Does the fork pin or track upstream?** Default is pin-and-pull-deliberately; revisit if upstream ships
+  something we want.
 - **Does upstreaming matter?** The fork could be kept contribution-shaped to submit hopscotch back to
-  Pollen Robotics. Not decided; costs discipline, and is reversible either way.
+  Pollen Robotics. Not decided; costs discipline, reversible either way. Note the sim-only scope makes our
+  work less directly useful to them, since their interest is hardware.
 
-## Sources
+## Revision history
 
-- [pollen-robotics/microduck_rl](https://github.com/pollen-robotics/microduck_rl) — README and CLAUDE.md
-- [pollen-robotics/microduck](https://github.com/pollen-robotics/microduck) — on-robot Rust runtime
-- [mujocolab/mjlab](https://github.com/mujocolab/mjlab) — training framework
-- [HF Jobs configuration](https://huggingface.co/docs/hub/jobs-configuration) — flavors, pricing, timeouts, volumes
-- [Pollen Robotics — Microduck](https://pollen-robotics.com/microduck/)
+- **2026-09-04, session 1** — original decisions. Approach A chosen; B rejected as undeployable; C
+  rejected as brittle. S1 blocking.
+- **2026-09-04, session 2** — S2 and S3 resolved. Command-block semantics resolved. Hop env and both
+  flight rewards built. Prior art found, contesting A vs C on evidence.
+- **2026-09-04, session 3** — **scope narrowed to sim-only, hardware deferred.** B's rejection reason
+  voided and B reopened as a deferred option; C recorded as the fallback. S1 closed without spending and
+  superseded by **S5 (forward hop)**; **S6 (perception)** added, deferred. Forward-intent encoding decided
+  (E1 now, E3 later, E2 rejected with receipts). Course sizing dissolved into a free variable. Budget
+  posture set at 2-3 runs.
