@@ -1,7 +1,13 @@
 # Microduck Hopscotch
 
 Teach Pollen Robotics' Microduck to hop, then to hopscotch — trained in MuJoCo simulation on Hugging
-Face Jobs, ultimately deployed to the physical robot.
+Face Jobs. **Sim-only** as of session 3; hardware is deferred, not dropped (see Scope).
+
+> **Start here (fresh session).** Read this file, then
+> [`../microduck-hopscotch-architecture.md`](../microduck-hopscotch-architecture.md) (decisions) and
+> [`hopscotch-routine.md`](./hopscotch-routine.md) (what we're ultimately building). Current state and
+> the next action are in **Session 4 — start here** below. Everything above that section is standing
+> context; everything in it is live.
 
 ## Scope (session 3, 2026-09-04)
 
@@ -12,7 +18,7 @@ them is a one-way door. What the scope change actually unlocks is that two hardw
 now ours to flip if we want them: mjlab's native `height_scan`, and promoting `base_lin_vel` from
 critic-only to the actor. Neither is flipped yet — see S6 in the architecture doc.
 
-## Current state (2026-09-04, end of session 2)
+## Historical: state at end of session 2 (2026-09-04) — superseded by Session 4 above
 
 **The remote pipeline works end-to-end, and the hop env exists and is GPU-validated.**
 
@@ -48,11 +54,82 @@ the key came from `_netrc`.
 > outright, locally, with the same `UnicodeEncodeError: 'charmap' codec`. Prefix
 > `PYTHONIOENCODING=utf-8` on any `train` invocation on Windows.
 
-## Session 3 state (2026-09-05)
+## Session 4 — START HERE (state as of 2026-09-05, end of session 3)
 
-**S5 is implemented and training.** Run `s5-forward-hop`, job `6a9bf2e6259f8e97255e28a5`,
-`Mjlab-HopForward-Flat-MicroDuck`, 4096 envs × 1500 iters, video on; checkpoints and mp4s land in
-`chelleboyer/s5-forward-hop`.
+**S5 ran to completion and the duck hops — but the reward shape is wrong, and fixing it is the next
+job.** Run `s5-forward-hop` (job `6a9bf2e6259f8e97255e28a5`), `Mjlab-HopForward-Flat-MicroDuck`,
+4096 envs × 1500 iters, COMPLETED. Artifacts in `chelleboyer/s5-forward-hop`: `model_1499.pt`,
+9 training videos, and a local export at `logs/dl/policy.onnx`.
+
+### What the run produced
+
+- **A working forward bunny hop.** Confirmed on video by the user. Training logged
+  `forward_flight_progress` at **~95% of the 0.4 m/s cap** — the cap is SATURATED, so the metric can no
+  longer distinguish good from great and `FORWARD_VEL_CAP` needs raising next run.
+- **The eval battery measured** 104 genuine hops, 5.2/episode, 8 consecutive, 98% upright landings.
+- **Keep this policy as the "bunny hop" artifact.** It is the first thing this project trained that
+  visibly does the thing.
+
+### The two changes that define the next run
+
+**1. Stop rewarding "airborne" as the accomplishment (user's call, and the data agrees).**
+`simultaneous_flight` pays **1.0 per step** while airborne, so air time IS the objective — and the
+policy ended up **airborne ~52% of its life** (`simultaneous_flight` 2.58 ÷ weight 5.0). That is
+bouncing, not hopping, and it explains why `hop_landing_quality` was the weakest term (0.138): the
+policy earns from being in the air, not from landing anywhere. The flight duration of a single hop was
+capped, but the *fraction of life spent flying* was not.
+
+Replace it with **"take off HERE → land THERE"**: a per-hop DISPLACEMENT reward paid **once at
+landing**, not per-step while airborne. This is also exactly what E3 (commanded hop distance,
+`body_pose[0]`) was designed to be, so the two merge rather than compete. `simultaneous_flight` should
+demote to a small enabling term or disappear.
+
+**2. Head up on landing (user's call).** The head rides low because deviation 3 deliberately FREED it
+(`head_pose_tracking` 2.0 → 0.5, `head_pose_bias` curriculum removed) so its 280 g could act as a
+countermovement. Do **not** fix this by raising `head_pose_tracking` — `microduck_velocity_env_cfg.py:729-737`
+records that tightening it made the policy stop moving entirely. The right tools are:
+  - a **head-upright factor inside `hop_landing_quality`**, pricing posture only AT TOUCHDOWN and
+    leaving mid-flight swing free; and
+  - re-introducing **`head_pose_bias`** (L1 on a 1 s EMA), which was built for exactly this droop and
+    charges DC bias while letting oscillation cancel.
+
+### Tooling added this session (all CPU, all free)
+
+- `scripts/hopscotch/hop_eval.py` — headless eval battery; per-hop displacement, flight duration, apex
+  rise, landing tilt, upright rate, consecutive streaks, S5 verdict.
+- `scripts/hopscotch/training_montage.py` — stitches a run's clips into one labelled progression video.
+- `scripts/hopscotch/flight_probe.py --view` — watch the best open-loop hop in slow motion.
+- `scripts/export.py` **works on CPU** — no GPU needed to export a checkpoint.
+
+### ⚠ Do NOT trust the eval battery's FORWARD verdict
+
+It drives **position servos**; training drives **BAM** (voltage model, back-EMF). On this policy it
+reported median **−2.2 mm/hop** while training logged ~95% of the velocity cap and the video plainly
+showed forward hopping. **The harness is the outlier.** Its hop count, consecutive streaks, landing-tilt
+distribution and fall rate ARE reliable (geometry and contact, not torque). Closing that gap — or
+accepting it permanently — is an open task.
+
+A related trap it already caught the hard way: it defaulted to raw accelerometer while training uses
+`USE_PROJECTED_GRAVITY = True`, and failed as a convincing BAD-POLICY verdict rather than an error. The
+only tell was a physically impossible 0.0 mm apex rise. **Trust the impossible number, not the verdict.**
+
+### Known-stale / loose ends
+
+- The detailed S5 implementation plan lives at `.claude/plans/s5-forward-hop-and-landing-quality.md`,
+  which is **gitignored** (`.gitignore:44`). Every other planning doc is tracked. Move it or un-ignore it.
+- [`tickets/microduck-hopscotch-phase-0.md`](./tickets/microduck-hopscotch-phase-0.md) still frames MD-3
+  around the **closed** S1 question. Phase 1 is still unsliced — now slice it against
+  [`hopscotch-routine.md`](./hopscotch-routine.md).
+- `scripts/infer_policy.py` cannot run on Windows (`termios`/`tty`), and never overrides the MJCF's
+  placeholder `kp≈0.5` gains — so the deployment rehearsal likely inherits the same trap `hop_eval.py`
+  had to fix. Unverified.
+
+### Where the project is going
+
+[`hopscotch-routine.md`](./hopscotch-routine.md) specs all 14 steps of a human hopscotch turn against
+Microduck's capabilities. [`plans/abridged-court-demo.md`](./plans/abridged-court-demo.md) is the
+recommended first demo: a 3-square court, drop-not-throw marker, two-foot hops. **Only E3 blocks it**,
+and its non-training steps need no GPU.
 
 - **Video works end-to-end** — the first mp4s ever recovered from a job
   (`chelleboyer/s5-video-smoke2`). It took three attempts, because `--video` needs a GL backend the
@@ -84,6 +161,11 @@ the key came from `_netrc`.
    Phase 0 work: MD-1, MD-2, MD-3.
 5. [`prior-art-hop.md`](./prior-art-hop.md) — a community Microduck hop policy, what it proves and
    what it leaves open. Changes the shape of S1.
+5b. [`hopscotch-routine.md`](./hopscotch-routine.md) — **all 14 steps of a human hopscotch turn**, mapped
+   to Microduck capabilities, with the audit of what exists vs what is new. This is what the project is
+   building toward; slice Phase 1 against it.
+5c. [`plans/abridged-court-demo.md`](./plans/abridged-court-demo.md) — the recommended first demo:
+   3-square court, dropped marker, two-foot hops. Only E3 blocks it.
 6. [`command-block.md`](./command-block.md) — the 13D command block, where hop intent goes, and the
    `nominal_height` discrepancy.
 

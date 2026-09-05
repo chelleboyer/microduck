@@ -24,6 +24,15 @@ implementation ticket and carries most of the weight. Padding the first two woul
 
 ---
 
+> **⚠ SUPERSEDED IN PART (2026-09-05).** MD-3's spike question — *"can Microduck leave the ground?"* —
+> is **CLOSED**: answered affirmatively by the CPU probe plus prior art, without spending its GPU
+> budget. It was replaced by **S5** (*can it hop FORWARD and land upright?*), which has since been
+> implemented AND run: the duck hops forward, and the resulting reward-shape problem is now the live
+> work. **Read [`../hopscotch-rules.md`](../hopscotch-rules.md) § "Session 4 — START HERE" first**;
+> this file is accurate for MD-1/MD-2 and for MD-3's *implementation*, but its framing of the spike
+> question is historical. Phase 1 is still unsliced — slice it against
+> [`../hopscotch-routine.md`](../hopscotch-routine.md).
+
 ## Status (2026-09-04, end of session 2)
 
 - **MD-1** — **nearly done.** Fork merged and pinned; 199 CPU tests green; HF auth working, namespace

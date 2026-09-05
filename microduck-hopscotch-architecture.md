@@ -211,6 +211,28 @@ in-sim play hides the bug by applying the normalizer anyway.
 active) governing repos, uv-cache bucket **and billing**; wandb credentials forwarded from `~/.netrc` as a
 secret; the Hub as the artifact store.
 
+**The flight reward's shape is wrong, and S5's run proved it.** *(session 3, 2026-09-05)*
+`simultaneous_flight` pays **1.0 per step while airborne**, which makes AIR TIME the objective. The S5
+run drove that to its logical end: the policy spent **~52% of its life airborne** (`simultaneous_flight`
+2.58 ÷ weight 5.0), and `hop_landing_quality` stayed the weakest term in the stack (0.138). It bounces;
+it does not hop *to* anywhere. The per-flight duration was capped, but the *fraction of life spent
+flying* never was — CLAUDE.md's no-jackpot rule applied to one axis and not the other.
+
+**Decision: the main term becomes "take off HERE → land THERE"** — a per-hop DISPLACEMENT reward paid
+**once at landing**, not per-step in the air. Hopscotch is about landing in a specific square, so the
+reward should pay for arrival, not for hang time. This converges with **E3** (commanded hop distance in
+`body_pose[0]`), which was already the Phase 1 plan: the two become one term rather than competing.
+`simultaneous_flight` demotes to a small enabling term, or goes away — flight is a *means*, and paying
+for it directly is what produced the bounce.
+
+**Landing posture includes the head.** *(session 3)* The head rides low because the hop env deliberately
+freed it (deviation 3: `head_pose_tracking` 2.0 → 0.5, bias curriculum removed) so its 280 g could serve
+as a countermovement. That trade is still right in flight and wrong at touchdown. Fix it with a
+head-upright factor **inside the landing term** — pricing posture only at touchdown — plus the existing
+`head_pose_bias` (L1 on a 1 s EMA), which charges DC droop while letting oscillation cancel. Do **not**
+raise `head_pose_tracking`: `microduck_velocity_env_cfg.py:729-737` records that tightening it made the
+policy stop moving entirely.
+
 ## Missing pieces
 
 Built since session 1, no longer missing: the simultaneous-flight reward, the bilateral-clearance ramp,
@@ -342,6 +364,13 @@ submit only real training.
   rejected as brittle. S1 blocking.
 - **2026-09-04, session 2** — S2 and S3 resolved. Command-block semantics resolved. Hop env and both
   flight rewards built. Prior art found, contesting A vs C on evidence.
+- **2026-09-05, session 3 (later)** — **S5 ran to completion.** The duck hops forward (confirmed on
+  video; training logged forward travel at ~95% of the velocity cap, so the cap is saturated and needs
+  raising). But the run exposed the flight reward's shape as wrong — 52% of life airborne — so the main
+  term becomes per-hop displacement paid at landing, converging with E3, plus head-upright at touchdown.
+  Eval battery, training-montage builder and probe viewer added; all CPU, all free. Recorded a hard
+  limitation: the eval battery drives position servos while training drives BAM, so its FORWARD numbers
+  are not trustworthy (it read −2.2 mm/hop against a policy the video shows hopping forward).
 - **2026-09-04, session 3** — **scope narrowed to sim-only, hardware deferred.** B's rejection reason
   voided and B reopened as a deferred option; C recorded as the fallback. S1 closed without spending and
   superseded by **S5 (forward hop)**; **S6 (perception)** added, deferred. Forward-intent encoding decided
