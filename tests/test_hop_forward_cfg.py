@@ -19,6 +19,10 @@ from mjlab_microduck.tasks.microduck_hop_env_cfg import (
     FORWARD_VEL_CAP,
     HOP_DISP_CAP,
     HOP_DISP_WEIGHT,
+    HOP_HEAD_TRACK_WEIGHT,
+    HOP_MIN_GROUND_S,
+    HOP_SETTLE_WEIGHT,
+    HOP_SETTLE_WINDOW_S,
     HOP_TRACK_LIN_VEL_WEIGHT,
     IMPACT_FREE_SPEED,
     LANDING_HEAD_UPRIGHT_STD,
@@ -157,6 +161,31 @@ def test_displacement_cap_has_headroom_over_the_s5_pass_mark():
     assert p["disp_cap"] > 0.008       # ...and far above the 8 mm open-loop floor
 
 
+def test_the_hop_rhythm_is_encoded_not_hoped_for():
+    # S5.2 (user call): "head up, hop, stay in place for a sec, then hop again".
+    # A cadence has to be IN the reward — CLAUDE.md: encode what counts as the
+    # maneuver in state-based structure, not in small nudges.
+    cfg = make_microduck_hop_env_cfg(forward=True)
+    disp = cfg.rewards["hop_displacement"].params
+    settle = cfg.rewards["hop_settle"].params
+    # A hop is only paid in full if a pause preceded it...
+    assert disp["min_ground_s"] == HOP_MIN_GROUND_S > 0.0
+    # ...and the pause itself is worth something, so there is a gradient toward
+    # it rather than only a penalty for skipping it.
+    assert cfg.rewards["hop_settle"].func is microduck_mdp.hop_settle
+    assert cfg.rewards["hop_settle"].weight == HOP_SETTLE_WEIGHT > 0.0
+    # The hold pays out exactly as long as it takes to qualify for the next
+    # full-price hop: standing longer earns nothing, hopping does.
+    assert settle["settle_window_s"] == HOP_SETTLE_WINDOW_S == HOP_MIN_GROUND_S
+
+
+def test_holding_still_never_outearns_hopping():
+    # If the hold paid more than the hop, the optimal policy is to hop once and
+    # then stand in the window forever. It must sit below the hop payment.
+    cfg = make_microduck_hop_env_cfg(forward=True)
+    assert cfg.rewards["hop_settle"].weight < _final_weight(cfg, "hop_displacement")
+
+
 def test_forward_cap_was_raised_off_saturation():
     # The S5 run logged ~95% of the old 0.4 m/s cap. A saturated metric cannot
     # tell a good hop from a great one.
@@ -168,37 +197,61 @@ def test_forward_cap_was_raised_off_saturation():
     assert cfg.rewards["forward_flight_progress"].weight < 1.5
 
 
-def test_head_is_priced_at_touchdown_only():
-    # Note 12. The head stays FREE in flight (its 280 g is the countermovement)
-    # and is priced only in the landing window. Raising head_pose_tracking is
-    # the documented wrong fix — it made the policy stop moving entirely.
+def test_head_is_priced_at_touchdown_and_on_average():
+    # S5.2 (user call, watching the S5.1 video): "his head is just hanging down,
+    # we need to get that head up all the time". Touchdown-only pricing was too
+    # little — the duck spends most of its life between landings, and that is
+    # where it looked wrong. So BOTH instruments are live: the touchdown factor
+    # and the DC-bias term.
     fwd = make_microduck_hop_env_cfg(forward=True)
-    base = make_microduck_hop_env_cfg()
-    vel = make_microduck_velocity_env_cfg()
     params = fwd.rewards["hop_landing_quality"].params
     assert params["head_upright_std"] == LANDING_HEAD_UPRIGHT_STD
     # Wide on purpose: a factor tighter than the current droop collapses the
     # product and kills the gradient.
     assert params["head_upright_std"] >= 0.3
+    assert fwd.rewards["head_pose_bias"] is not None
+    assert "head_pose_bias_weight" in fwd.curriculum
+
+
+def test_the_head_fix_is_weight_not_std():
+    # THE receipt, and the one thing that must never drift:
+    # microduck_velocity_env_cfg.py:729-737 — tightening head_pose_tracking's
+    # STD (fine_std=0.1) made the policy stop moving entirely by iter 300,
+    # because a 280 g head MUST oscillate while the robot is moving and an
+    # instantaneous tolerance is therefore unescapable. The WEIGHT is a
+    # different dial, and the DC bias is the escapable half.
+    fwd = make_microduck_hop_env_cfg(forward=True)
+    vel = make_microduck_velocity_env_cfg()
+    assert fwd.rewards["head_pose_tracking"].params["std"] == (
+        vel.rewards["head_pose_tracking"].params["std"]
+    )
+    # Weight raised off the baseline's 0.5, but still under the walker's, so the
+    # head keeps room to swing as a countermovement mid-flight.
+    base = make_microduck_hop_env_cfg()
     assert (
-        fwd.rewards["head_pose_tracking"].weight
-        == base.rewards["head_pose_tracking"].weight
-        < vel.rewards["head_pose_tracking"].weight
+        base.rewards["head_pose_tracking"].weight
+        < fwd.rewards["head_pose_tracking"].weight
+        == HOP_HEAD_TRACK_WEIGHT
+        <= vel.rewards["head_pose_tracking"].weight
     )
 
 
-def test_head_pose_bias_returns_for_forward_only_and_gently():
+def test_head_pose_bias_returns_at_walker_strength_for_forward_only():
     fwd = make_microduck_hop_env_cfg(forward=True)
     vel = make_microduck_velocity_env_cfg()
+    # The baseline hop-in-place env keeps its head free — S5.2 must not leak.
     assert "head_pose_bias_weight" not in make_microduck_hop_env_cfg().curriculum
     stages = fwd.curriculum["head_pose_bias_weight"].params["weight_stages"]
     vel_stages = vel.curriculum["head_pose_bias_weight"].params["weight_stages"]
-    # Off during discovery, and gentler than the walker's ramp at the end: the
-    # head is load-bearing here, and the touchdown factor does the primary work.
+    # Off during discovery — a posture tax while a hard skill is being explored
+    # makes "do nothing" win — then the WALKER's full strength, because the
+    # walker's head is what "looks right" looks like.
     assert stages[0]["weight"] == 0.0
-    assert stages[-1]["weight"] < vel_stages[-1]["weight"]
-    # Arrives after the handover, never during skill discovery.
-    assert stages[1]["step"] > DISP_HANDOVER_ITER * 24
+    assert stages[-1]["weight"] >= vel_stages[-1]["weight"]
+    # ...and it arrives EARLIER than the walker's, because the droop is the
+    # complaint rather than a refinement.
+    assert stages[-1]["step"] < vel_stages[-1]["step"]
+    assert [s["weight"] for s in stages] == sorted(s["weight"] for s in stages)
 
 
 def test_velocity_tracking_is_demoted_but_alive():

@@ -264,6 +264,43 @@ CLEARANCE_WEIGHT_FORWARD = 1.5
 # weakest term in the S5 stack. Tighten once the head actually comes up.
 LANDING_HEAD_UPRIGHT_STD = 0.35
 
+# ── S5.2: head up ALWAYS, and a hop RHYTHM (user call, 2026-09-05) ────────────
+# Watching the S5.1 run's video: "his head is just hanging down, we need to get
+# that head up all the time" and "head up, hop, stay in place for a sec, then
+# hop again". Both are behaviour requirements, and both are reward changes.
+#
+# HEAD. Pricing the head only at touchdown (S5.1) was too little: the duck
+# spends most of its life between landings, and that is where it looks wrong.
+# The instrument for "up ON AVERAGE" is head_pose_bias — L1 on a 1 s EMA, which
+# charges the DC droop while letting the countermovement oscillation cancel.
+# It is brought to the WALKER's full strength (1/2/3) because the walker's head
+# looks right, and it arrives early rather than at iter 800.
+#
+# The documented trap is NOT this: microduck_velocity_env_cfg.py:729-737 records
+# that tightening head_pose_tracking's STD made the policy stop moving. That was
+# an instantaneous tolerance a 280 g head cannot escape while stepping. The
+# weight is a different dial, and the DC term is the escapable half — "at the
+# optimum this costs a walking policy nothing".
+HEAD_BIAS_STAGES = ((300, 1.0), (600, 2.0), (900, 3.0))
+# Partial restore of the instantaneous term, 0.5 -> 1.0. Still half the walker's
+# 2.0, so the head keeps room to swing as a countermovement mid-flight.
+HOP_HEAD_TRACK_WEIGHT = 1.0
+
+# RHYTHM. Seconds of standing still before a takeoff for a hop to be paid in
+# full. Scaled smoothly, not gated (see hop_displacement) — a cliff would pay 0
+# for every hop a bouncing policy can currently produce and the term would go
+# silent. 0.5 s is "a sec" at the scale of a 25 cm robot: long enough to read as
+# a deliberate pause on video, short enough to keep a routine watchable.
+HOP_MIN_GROUND_S = 0.5
+# How long after a landing the hold is worth paying for. Matched to
+# HOP_MIN_GROUND_S so the payment stops exactly when the next hop becomes
+# fully-paid: standing longer earns nothing, hopping does.
+HOP_SETTLE_WINDOW_S = 0.5
+# Horizontal speed at which "still" scores zero. A hop that skids on landing is
+# not a hold.
+HOP_SETTLE_MAX_SPEED = 0.15
+HOP_SETTLE_WEIGHT = 1.5
+
 
 def make_microduck_hop_env_cfg(
     play: bool = False, rough: bool = False, forward: bool = False
@@ -355,6 +392,22 @@ def make_microduck_hop_env_cfg(
                 # Same window as hop_landing_quality: one event, one window.
                 "landing_window_s": LANDING_WINDOW_S,
                 "max_tilt_deg": FLIGHT_MAX_TILT_DEG,
+                # S5.2: a hop is only worth full marks if it followed a pause.
+                "min_ground_s": HOP_MIN_GROUND_S,
+            },
+        )
+
+        # S5.2: pay for the hold itself, so the pause has a gradient and not
+        # just a precondition. Sits below the hop payment by design — a hop is
+        # always worth more than standing after one.
+        cfg.rewards["hop_settle"] = RewardTermCfg(
+            func=microduck_mdp.hop_settle,
+            weight=HOP_SETTLE_WEIGHT,
+            params={
+                "sensor_name": "feet_ground_contact",
+                "settle_window_s": HOP_SETTLE_WINDOW_S,
+                "max_speed": HOP_SETTLE_MAX_SPEED,
+                "min_flight_s": FLIGHT_MIN_S,
             },
         )
 
@@ -414,6 +467,10 @@ def make_microduck_hop_env_cfg(
         # clearance < flight < displacement at every stage.
         cfg.rewards["bilateral_foot_clearance"].weight = CLEARANCE_WEIGHT_FORWARD
 
+        # S5.2: partial restore of the instantaneous head term (weight, NOT
+        # std — the std is what stopped the walker moving).
+        cfg.rewards["head_pose_tracking"].weight = HOP_HEAD_TRACK_WEIGHT
+
     # ── Curricula ─────────────────────────────────────────────────────────────
     # The velocity env ramps head_pose_bias from iter 600. Drop it: it is a
     # posture-precision tax on the head, and the head is a load-bearing part of
@@ -465,12 +522,11 @@ def make_microduck_hop_env_cfg(
             },
         )
 
-        # Note 12: head_pose_bias comes BACK for the forward variant — L1 on a
-        # 1 s EMA, which charges the DC droop while letting the countermovement
-        # oscillation cancel. Far gentler and later than the walker's
-        # 1.0/2.0/3.0 ramp, because here the head is a load-bearing part of the
-        # hop and the touchdown factor in hop_landing_quality is doing the
-        # primary work. Arrives after the handover, never during discovery.
+        # S5.2 — HEAD UP ALL THE TIME. head_pose_bias returns at the WALKER's
+        # full strength and early (see HEAD_BIAS_STAGES): it is the DC term, so
+        # it charges a permanently drooping head while leaving the in-flight
+        # countermovement swing free to cancel out. Still held at 0 through the
+        # first stage so it is not a posture tax during skill discovery.
         cfg.rewards["head_pose_bias"].weight = 0.0
         cfg.curriculum["head_pose_bias_weight"] = CurriculumTermCfg(
             func=microduck_mdp.reward_weight,
@@ -478,8 +534,10 @@ def make_microduck_hop_env_cfg(
                 "reward_name": "head_pose_bias",
                 "weight_stages": [
                     {"step": 0, "weight": 0.0},
-                    {"step": 800 * NUM_STEPS_PER_ENV, "weight": 0.5},
-                    {"step": 1200 * NUM_STEPS_PER_ENV, "weight": 1.0},
+                    *[
+                        {"step": it * NUM_STEPS_PER_ENV, "weight": w}
+                        for it, w in HEAD_BIAS_STAGES
+                    ],
                 ],
             },
         )

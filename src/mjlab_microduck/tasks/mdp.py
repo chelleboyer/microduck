@@ -7668,6 +7668,11 @@ def _hop_displacement_state(env: ManagerBasedRlEnv) -> None:
         # Seconds since the landing edge of the latched hop. _HOP_NO_LANDING
         # means "no live landing", which is the state everything starts in.
         env._hop_since_land = torch.full((n,), _HOP_NO_LANDING, device=env.device)
+        # Continuous grounded time before the CURRENT flight. Frozen while
+        # airborne, so at a landing edge it still holds the length of the pause
+        # that preceded the takeoff — which is what makes "hop, hold a beat, hop
+        # again" checkable at the moment the hop is paid.
+        env._hop_ground_s = torch.zeros(n, device=env.device)
         env._hop_disp_last_step = -1
 
 
@@ -7676,6 +7681,7 @@ def _update_hop_displacement(
     sensor_name: str,
     min_flight_s: float,
     asset_cfg: SceneEntityCfg,
+    min_ground_s: float = 0.0,
 ) -> torch.Tensor:
     """Advance the takeoff latch one control step; return the latched hop distance.
 
@@ -7722,8 +7728,19 @@ def _update_hop_displacement(
     banked = ((xy - env._hop_takeoff_xy) * env._hop_takeoff_fwd).sum(dim=-1)
     landed_now = (~airborne) & env._hop_was_airborne
     genuine = landed_now & (flew >= min_flight_s)
+
+    # THE RHYTHM: a hop only counts in proportion to the pause that preceded
+    # it. ``_hop_ground_s`` froze at takeoff, so at this edge it still holds the
+    # length of that pause. Deliberately a smooth ramp, not a cliff — a hard
+    # gate would pay exactly 0 for every hop a bouncing policy can currently
+    # produce, which is how a term goes silent and stops teaching anything
+    # (the failure mode forward_flight_progress sat in through all of S5).
+    if min_ground_s > 0.0:
+        pause = (env._hop_ground_s / min_ground_s).clamp(max=1.0)
+    else:
+        pause = torch.ones_like(banked)
     env._hop_last_disp = torch.where(
-        landed_now, torch.where(genuine, banked, zeros), env._hop_last_disp
+        landed_now, torch.where(genuine, banked * pause, zeros), env._hop_last_disp
     )
 
     # 1b. The payment window is driven by THIS latch, not by re-reading the
@@ -7745,6 +7762,14 @@ def _update_hop_displacement(
         ),
     )
 
+    # 1c. Grounded-time clock: counts the pause between hops, freezes in the
+    # air, restarts at touchdown.
+    env._hop_ground_s = torch.where(
+        airborne,
+        env._hop_ground_s,
+        torch.where(landed_now, zeros, env._hop_ground_s + float(env.step_dt)),
+    )
+
     # 2. Re-arm: while grounded, the takeoff pose is just the current pose.
     grounded = (~airborne).unsqueeze(-1)
     fwd = _heading_xy(asset.data.root_link_quat_w)
@@ -7760,6 +7785,7 @@ def _update_hop_displacement(
     env._hop_since_land = torch.where(
         fresh, torch.full_like(env._hop_since_land, _HOP_NO_LANDING), env._hop_since_land
     )
+    env._hop_ground_s = torch.where(fresh, zeros, env._hop_ground_s)
     return env._hop_last_disp
 
 
@@ -7770,6 +7796,7 @@ def hop_displacement(
     min_flight_s: float = 0.02,
     landing_window_s: float = 0.15,
     max_tilt_deg: float = 30.0,
+    min_ground_s: float = 0.0,
     settle_steps: int = 2,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
@@ -7810,8 +7837,17 @@ def hop_displacement(
     ``disp_cap`` is derived, and must be re-derived, exactly like
     ``FORWARD_VEL_CAP`` — which the S5 run saturated at ~95%, at which point a
     metric can no longer tell good from great. See the cfg constant.
+
+    ``min_ground_s`` makes the PAUSE part of what a hop is: the payment scales
+    with how long the robot stood still before taking off, so a continuous
+    bounce collects almost nothing and "hop, hold a beat, hop again" is the
+    argmax. This is hopscotch's actual rhythm — you land in a square and stand
+    in it — and it is the second half of the fix for a policy that was living
+    in the air. Companion term: ``hop_settle``, which pays for the hold itself.
     """
-    disp = _update_hop_displacement(env, sensor_name, min_flight_s, asset_cfg)
+    disp = _update_hop_displacement(
+        env, sensor_name, min_flight_s, asset_cfg, min_ground_s
+    )
     progress = disp.clamp(min=0.0, max=disp_cap) / max(disp_cap, 1e-6)
 
     asset: Entity = env.scene[asset_cfg.name]
@@ -7826,3 +7862,56 @@ def hop_displacement(
     landed = env._hop_since_land <= landing_window_s
     settled = env.episode_length_buf > settle_steps
     return progress * (landed & settled & upright).float()
+
+
+def hop_settle(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    settle_window_s: float = 0.5,
+    max_speed: float = 0.15,
+    max_tilt_deg: float = 20.0,
+    min_flight_s: float = 0.02,
+    settle_steps: int = 2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Pay for planting and HOLDING STILL for a beat after a hop. [0, 1].
+
+    Positive weight. The rhythm's other half: ``hop_displacement`` makes the
+    pause a PRECONDITION of being paid for a hop, and this makes the pause
+    itself worth something, so the policy has a gradient toward standing still
+    rather than only a penalty for not having done so.
+
+    Three reasons this cannot become "stand there forever and farm it":
+
+    - It only pays inside ``settle_window_s`` of a genuine landing, tracked by
+      the ``hop_displacement`` latch (which requires a real flight first). A
+      policy that never hops never opens the window.
+    - The window is short. Once it closes, the only way to earn again is to
+      hop, land, and hold once more — which is the cadence we want.
+    - It is capped at 1.0/step and sits well under the hop payment, so a hop is
+      always worth more than the hold that follows it.
+
+    CLAUDE.md's rule about never gating a positive reward on a BAD state is
+    respected: standing still upright on both feet is the goal state of a hop,
+    not a degenerate one. The rule's target is rewards that pay while fallen.
+
+    Stillness is scored on horizontal speed only. Vertical velocity at
+    touchdown is the landing impact, which ``hop_landing_impact_penalty``
+    already prices; charging it here too would double-tax the same event.
+    """
+    _update_hop_displacement(env, sensor_name, min_flight_s, asset_cfg)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    v_xy = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, :2], nan=10.0)
+    speed = v_xy.norm(dim=-1)
+    still = (1.0 - speed / max(max_speed, 1e-6)).clamp(min=0.0, max=1.0)
+
+    quat = asset.data.root_link_quat_w
+    cos_tilt = torch.nan_to_num(
+        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
+    )
+    upright = cos_tilt > math.cos(math.radians(max_tilt_deg))
+
+    in_window = env._hop_since_land <= settle_window_s
+    settled = env.episode_length_buf > settle_steps
+    return still * (in_window & upright & settled).float()

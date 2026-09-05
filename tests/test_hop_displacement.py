@@ -20,7 +20,7 @@ import math
 
 import torch
 
-from mjlab_microduck.tasks.mdp import hop_displacement
+from mjlab_microduck.tasks.mdp import hop_displacement, hop_settle
 
 CAP = 0.10
 UPRIGHT = (1.0, 0.0, 0.0, 0.0)
@@ -46,6 +46,7 @@ class _AssetData:
         self.root_link_pos_w[:, 2] = 0.1167
         self.root_link_quat_w = torch.zeros(n, 4)
         self.root_link_quat_w[:, 0] = 1.0
+        self.root_link_lin_vel_w = torch.zeros(n, 3)
 
 
 class _Asset:
@@ -303,6 +304,70 @@ def test_a_stale_hop_cannot_be_re_collected_by_tapping_one_foot():
     assert r.step().tolist() == [0.0]
 
 
+# ------------------------------------------------------------------ rhythm ----
+# S5.2 (user call): "head up, hop, stay in place for a sec, then hop again".
+# The pause is part of what a hop IS, so it is priced at the moment the hop is
+# paid — using the grounded clock frozen at takeoff.
+
+PAUSE = 0.5  # HOP_MIN_GROUND_S
+
+
+def _stand(rig, seconds):
+    for _ in range(int(round(seconds / rig.step_dt))):
+        rig.ground()
+        rig.step(min_ground_s=PAUSE)
+
+
+def test_a_hop_after_a_full_pause_pays_in_full():
+    r = _fresh()
+    _stand(r, PAUSE)
+    assert math.isclose(_hop(r, dx=0.05, min_ground_s=PAUSE).item(), 0.5, rel_tol=1e-3)
+
+
+def test_a_bounce_with_no_pause_pays_almost_nothing():
+    # THE behaviour being removed: continuous bouncing. Same 50 mm of travel,
+    # but taken straight off a landing, is worth a fraction of the same hop
+    # taken from a stand.
+    r = _fresh()
+    _stand(r, PAUSE)
+    _hop(r, dx=0.05, min_ground_s=PAUSE)          # a proper hop
+    bounce = _hop(r, dx=0.05, min_ground_s=PAUSE)  # relaunch immediately
+    assert bounce.item() < 0.1 * 0.5
+
+
+def test_the_pause_scales_smoothly_rather_than_gating():
+    # A cliff would pay exactly 0 for every hop a bouncing policy can currently
+    # produce, and the term would go silent — the failure mode
+    # forward_flight_progress sat in through all of S5's smoke tests.
+    scores = []
+    for held in (0.0, 0.25 * PAUSE, 0.5 * PAUSE, PAUSE):
+        r = _fresh()
+        _stand(r, held)
+        scores.append(_hop(r, dx=0.05, min_ground_s=PAUSE).item())
+    assert scores == sorted(scores), scores
+    assert scores[0] < scores[-1]
+    assert 0.0 < scores[2] < scores[-1]   # partial credit really is partial
+
+
+def test_pausing_longer_than_required_earns_no_more():
+    # Otherwise "stand still forever" beats hopping.
+    short, long = _fresh(), _fresh()
+    _stand(short, PAUSE)
+    _stand(long, 4 * PAUSE)
+    a = _hop(short, dx=0.05, min_ground_s=PAUSE).item()
+    b = _hop(long, dx=0.05, min_ground_s=PAUSE).item()
+    assert math.isclose(a, b, rel_tol=1e-6)
+
+
+def test_air_time_does_not_count_as_pause():
+    # The grounded clock must freeze in flight, or a long hang would qualify
+    # the NEXT hop and the bounce comes straight back.
+    r = _fresh()
+    _stand(r, PAUSE)
+    _hop(r, dx=0.05, flight_s=0.28, min_ground_s=PAUSE)
+    assert _hop(r, dx=0.05, flight_s=0.28, min_ground_s=PAUSE).item() < 0.1 * 0.5
+
+
 def test_a_freshly_reset_env_banks_nothing():
     r = _fresh()
     r.episode_length_buf[:] = 1
@@ -319,6 +384,69 @@ def test_nan_positions_do_not_pay():
     r.place(x=0.05)
     out = r.step()
     assert torch.isfinite(out).all()
+
+
+# ------------------------------------------------------------------ settle ----
+# The rhythm's other half: paying for the hold itself, so the pause has a
+# gradient toward it and not only a precondition attached to it.
+
+def _settle(rig, **kw):
+    return hop_settle(rig, sensor_name="contact", **kw)
+
+
+def test_the_hold_after_a_hop_pays():
+    r = _fresh()
+    _stand(r, PAUSE)
+    _hop(r, dx=0.05, min_ground_s=PAUSE)
+    r.ground(contact_t=0.02)
+    assert _settle(r).item() > 0.9
+
+
+def test_standing_without_ever_hopping_pays_nothing():
+    # The window only opens on a genuine landing, so "never hop, just stand"
+    # earns zero — this is what stops the hold being farmable.
+    r = _fresh()
+    _stand(r, 3.0)
+    assert _settle(r).tolist() == [0.0]
+
+
+def test_the_hold_stops_paying_once_the_window_closes():
+    r = _fresh()
+    _stand(r, PAUSE)
+    _hop(r, dx=0.05, min_ground_s=PAUSE)
+    assert _settle(r).item() > 0.0
+    for _ in range(int(round((PAUSE + 0.1) / r.step_dt))):
+        r.ground()
+        r.step()
+    assert _settle(r).tolist() == [0.0]
+
+
+def test_skidding_on_landing_is_not_a_hold():
+    r = _fresh()
+    _stand(r, PAUSE)
+    _hop(r, dx=0.05, min_ground_s=PAUSE)
+    r.ground(contact_t=0.02)
+    r._asset.root_link_lin_vel_w[:, 0] = 0.4   # sliding forward
+    assert _settle(r).item() == 0.0
+
+
+def test_a_toppled_landing_is_not_a_hold():
+    r = _fresh()
+    _stand(r, PAUSE)
+    _hop(r, dx=0.05, min_ground_s=PAUSE)
+    r.ground(contact_t=0.02)
+    r.place(quat=_pitch(50.0))
+    assert _settle(r).item() == 0.0
+
+
+def test_settle_is_never_negative():
+    r = _fresh()
+    _stand(r, PAUSE)
+    _hop(r, dx=0.05, min_ground_s=PAUSE)
+    for v in (0.0, 0.3, -2.0, float("nan")):
+        r._asset.root_link_lin_vel_w[:, 0] = v
+        out = _settle(r)
+        assert torch.isfinite(out).all() and (out >= 0.0).all()
 
 
 def test_batched_envs_are_independent():
