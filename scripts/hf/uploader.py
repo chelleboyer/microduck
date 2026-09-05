@@ -1,8 +1,14 @@
-"""Checkpoint uploader run inside an HF Job.
+"""Checkpoint + video uploader run inside an HF Job.
 
-Watches `logs/rsl_rl/**/model_*.pt` and uploads new/updated files to the
-target HF Model repo. Designed to be `nohup uv run`-launched from the job
-bootstrap, with auth coming from the HF_TOKEN secret injected by `hf jobs run`.
+Watches `logs/rsl_rl/**/` for `model_*.pt`, the dumped `params/*`, and any
+training videos, and uploads new/updated files to the target HF Model repo.
+Designed to be `nohup uv run`-launched from the job bootstrap, with auth coming
+from the HF_TOKEN secret injected by `hf jobs run`.
+
+Videos matter as much as checkpoints: CLAUDE.md is explicit that "sim metrics
+can pass while the video fails the human eye", and the dev machine has no CUDA,
+so nothing renders locally — footage recovered from the job is the ONLY way to
+watch a policy move. Enable it with `--video True` on the train command.
 """
 
 from __future__ import annotations
@@ -13,6 +19,12 @@ import time
 from pathlib import Path
 
 from huggingface_hub import HfApi, CommitOperationAdd
+
+# A file untouched for this long is treated as finished being written. mjlab
+# writes a video progressively across its frames, so without this guard a clip
+# caught mid-write uploads truncated, then uploads again when its mtime moves —
+# a wasted commit and a corrupt artifact in between.
+SETTLE_S = 5.0
 
 
 def main() -> int:
@@ -38,14 +50,24 @@ def main() -> int:
             # also pick up the dumped configs once
             files += [p for p in root.glob("**/params/*.yaml")]
             files += [p for p in root.glob("**/params/*.json")]
+            # training videos (mjlab writes <log_dir>/videos/train/*.mp4 when
+            # the run is launched with --video True)
+            files += [p for p in root.glob("**/videos/**/*.mp4")]
 
+            now = time.time()
             to_upload: list[CommitOperationAdd] = []
             for f in files:
                 try:
-                    mtime = f.stat().st_mtime
+                    stat = f.stat()
                 except FileNotFoundError:
                     continue
+                mtime = stat.st_mtime
                 if sent.get(f) == mtime:
+                    continue
+                # Still being written? Leave it for the next poll. Skipped in
+                # one-shot mode (the final upload as the job exits), where
+                # there IS no next poll and a partial file beats no file.
+                if not one_shot and (now - mtime) < SETTLE_S:
                     continue
                 # use path-in-repo relative to logs/rsl_rl so the repo mirrors run dirs
                 rel = f.relative_to(root)
