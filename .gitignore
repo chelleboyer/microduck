@@ -42,3 +42,5 @@ logdir/.claude/worktrees/
 # --- fork: microduck-hopscotch ---
 # Kept at the end so upstream's edits above merge cleanly.
 .claude/
+training_montage.mp4
+*.mp4
