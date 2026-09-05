@@ -25,9 +25,25 @@ checkpoint is never the expensive step.
 
 The cost of that choice, stated plainly: this is the DEPLOYMENT path, not the
 training env. No domain randomization, no backlash, no observation noise, no
-command delay. Numbers here are therefore optimistic relative to the trained
-distribution — the same caveat flight_probe.py carries. Use the -Backlash-
-twin's ONNX for the pessimistic read.
+command delay.
+
+**AND — read this before believing a verdict — A DIFFERENT ACTUATOR.** Training
+drives these joints with the BAM voltage model (kp_fw=200, back-EMF,
+load-dependent friction, force limit +/-1.07 Nm). This harness drives plain
+MJCF position servos at --kp. A policy optimised against BAM dynamics does NOT
+reproduce faithfully under a position servo, and the gap shows up exactly where
+a hop lives: fast joint motion, where back-EMF dominates.
+
+Measured on the first real policy (run s5-forward-hop, 2026-09-05): training
+logged forward travel at ~95% of the 0.4 m/s cap and the video plainly showed
+forward hopping, while this harness reported a median of -2.2 mm/hop. The
+harness is the outlier. Treat its FORWARD numbers as a lower bound of unknown
+tightness until the actuator gap is closed, and prefer wandb + the video for
+"did it learn to travel".
+
+What this harness IS reliable for, because they do not depend on actuator
+fidelity: hop COUNT, consecutive-hop streaks, landing tilt distribution, and
+fall rate. Those are geometry and contact, not torque.
 
 THE METRIC TRAPS (both cost real money in this project)
 -------------------------------------------------------
@@ -283,8 +299,16 @@ def main() -> None:
     ap.add_argument("--noise", type=float, default=0.02, help="init joint noise (rad)")
     ap.add_argument("--hop-cmd", type=float, default=0.06,
                     help="body_pose[2] hop intent, m (HOP_CMD_MAX default)")
-    ap.add_argument("--projected-gravity", action="store_true",
-                    help="policy was trained with projected gravity, not raw accel")
+    # MUST match USE_PROJECTED_GRAVITY in microduck_velocity_env_cfg.py (True as
+    # of pin 1e79c29). Getting this wrong feeds the policy a gravity signal it
+    # never trained on, and it fails in a way that looks like a BAD POLICY
+    # rather than a bad harness: during development the mismatch produced
+    # "hops" with 0.0 mm apex rise, negative displacement and 100% falls, while
+    # training metrics said the policy was hopping forward at 95% of the
+    # velocity cap. Trust the impossible-looking number, not the verdict.
+    ap.add_argument("--raw-accel", dest="projected_gravity", action="store_false",
+                    default=True,
+                    help="policy was trained on raw accelerometer, not projected gravity")
     ap.add_argument("--kp", type=float, default=20.0,
                     help="position gain override; the MJCF ships kp~0.5 placeholders "
                          "that CANNOT hold STAND (see docs/s1-flight-probe.md)")
@@ -382,6 +406,9 @@ def main() -> None:
         print(f"open-loop baseline (free):  {OPEN_LOOP_FORWARD_M*1e3:.0f} mm/hop")
         print(f"measured (this policy):     {fwd_med*1e3:.1f} mm/hop, "
               f"{upright_rate:.0%} upright, {consec} consecutive")
+        print("CAVEAT: forward travel here is measured under a POSITION SERVO, "
+              "not BAM.\nCross-check Episode_Reward/forward_flight_progress and "
+              "the video before acting on a forward FAIL (see module docstring).")
         if (fwd_med >= S5_PASS_FORWARD_M and upright_rate >= S5_MIN_UPRIGHT_RATE
                 and consec >= S5_MIN_CONSECUTIVE):
             verdict = ("PASS -> forward-hop track. Size the course cells to the "
