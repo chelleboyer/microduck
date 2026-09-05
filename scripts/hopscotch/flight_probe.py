@@ -111,6 +111,67 @@ def leg_extension_pattern(model: mujoco.MjModel, stand_qpos: np.ndarray) -> dict
     return pattern
 
 
+def leg_push_pattern(model: mujoco.MjModel, stand_qpos: np.ndarray) -> dict[int, float]:
+    """Derive the REARWARD push direction — the forward-travel companion to
+    ``leg_extension_pattern``.
+
+    Extension drives the foot straight down (trunk up). To travel forward the
+    legs must also drive the foot BACKWARD: with the sole held by friction, a
+    foot pushed rearward drives the trunk forward.
+
+    Same rule as the extension pattern applies — do NOT hand-guess this. Here
+    we want the joint direction that moves the foot horizontally backward while
+    keeping the foot FLAT (dpitch = 0) and its height unchanged (dfoot_z = 0),
+    which is the null space of the [dfoot_z; dpitch] rows of the leg Jacobian —
+    exactly the extension derivation with the constrained rows swapped.
+
+    Normalised on the largest component rather than the knee: the knee
+    dominates extension but need not dominate a horizontal push, so dividing by
+    it can blow up. Oriented so positive s pushes the foot BACKWARD.
+    """
+    data = mujoco.MjData(model)
+    pattern: dict[int, float] = {}
+    eps = 1e-3
+
+    for jnames_hip, jname_knee, jname_ankle, bodyname, act_idx in _LEGS.values():
+        jnames = (jnames_hip, jname_knee, jname_ankle)
+        adr = [model.jnt_qposadr[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, j)]
+               for j in jnames]
+        body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, bodyname)
+
+        def foot_state(delta: np.ndarray, adr=adr, body=body) -> tuple[float, float, float]:
+            q = stand_qpos.copy()
+            for a, dv in zip(adr, delta):
+                q[a] += dv
+            data.qpos[:] = q
+            mujoco.mj_forward(model, data)
+            p = data.xpos[body]
+            R = data.xmat[body].reshape(3, 3)
+            pitch = math.degrees(math.atan2(-R[2, 0], math.hypot(R[2, 1], R[2, 2])))
+            return float(p[0]), float(p[2]), pitch
+
+        x0, z0, pitch0 = foot_state(np.zeros(3))
+        jac = np.zeros((3, 3))  # rows: dfoot_x, dfoot_z, dpitch
+        for c in range(3):
+            dv = np.zeros(3)
+            dv[c] = eps
+            x1, z1, pitch1 = foot_state(dv)
+            jac[:, c] = ((x1 - x0) / eps, (z1 - z0) / eps, (pitch1 - pitch0) / eps)
+
+        # Keep the foot flat (dpitch=0) and at height (dfoot_z=0) -> pure
+        # horizontal travel.
+        _, _, vt = np.linalg.svd(jac[[1, 2], :])
+        direction = vt[-1]
+        scale = np.abs(direction).max()
+        direction = direction / (scale if scale > 1e-9 else 1.0)
+        if jac[0] @ direction > 0:                          # foot must go BACKWARD
+            direction = -direction
+        for idx, coeff in zip(act_idx, direction):
+            pattern[idx] = float(coeff)
+
+    return pattern
+
+
 @dataclass
 class Result:
     s_crouch: float
@@ -122,6 +183,8 @@ class Result:
     tilt_at_land_deg: float  # trunk tilt from vertical when contact resumes
     max_tilt_deg: float      # worst tilt at any point after settling
     landed_upright: bool
+    s_push: float = 0.0      # rearward push blended in during extension
+    forward_m: float = 0.0   # net trunk +x travel ACROSS THE FLIGHT INTERVAL
 
     @property
     def is_hop(self) -> bool:
@@ -169,10 +232,19 @@ def _tilt_deg(data: mujoco.MjData) -> float:
     return math.degrees(math.acos(max(-1.0, min(1.0, up_z))))
 
 
-def _ctrl_at(stand: np.ndarray, s: float, pattern: dict[int, float]) -> np.ndarray:
+def _ctrl_at(
+    stand: np.ndarray,
+    s: float,
+    pattern: dict[int, float],
+    p: float = 0.0,
+    push_pattern: dict[int, float] | None = None,
+) -> np.ndarray:
     ctrl = stand.copy()
     for idx, k in pattern.items():
         ctrl[idx] += k * s
+    if push_pattern:
+        for idx, k in push_pattern.items():
+            ctrl[idx] += k * p
     return ctrl
 
 
@@ -206,6 +278,8 @@ def simulate(
     trace: list | None = None,
     viewer=None,
     speed: float = 1.0,
+    s_push: float = 0.0,
+    push_pattern: dict[int, float] | None = None,
 ) -> Result:
     left, right = _foot_geoms(model)
     dt = model.opt.timestep
@@ -231,18 +305,23 @@ def simulate(
     tilt_at_land = 0.0
     max_tilt = 0.0
     saw_flight = False
+    x_takeoff = float(data.qpos[0])
+    best_forward = 0.0
 
     for i in range(n_steps):
         t = i * dt
         if t < t_crouch:                      # ramp down into the crouch
             s = s_crouch * (t / t_crouch)
+            p = 0.0
         elif t < t_crouch + t_extend:         # drive up through extension
             u = (t - t_crouch) / t_extend
             s = s_crouch + (s_extend - s_crouch) * u
+            p = s_push * u                    # push blends in WITH the drive
         else:                                 # hold extended, observe
             s = s_extend
+            p = s_push
 
-        data.ctrl[:] = _ctrl_at(stand_ctrl, s, pattern)
+        data.ctrl[:] = _ctrl_at(stand_ctrl, s, pattern, p, push_pattern)
         mujoco.mj_step(model, data)
         _sync(viewer, dt, speed)
         if viewer is not None and not viewer.is_running():
@@ -250,16 +329,23 @@ def simulate(
 
         n_down = _n_feet_down(data, left, right)
         z = float(data.qpos[2])
+        x = float(data.qpos[0])
         apex = max(apex, z)
         max_tilt = max(max_tilt, _tilt_deg(data))
 
         if n_down == 0:
+            # Measure travel over the FLIGHT interval only. Total episode
+            # displacement would credit a duck that walks forward and then
+            # hops in place as having hopped forward.
+            if cur_flight == 0.0:
+                x_takeoff = x
             cur_flight += dt
             saw_flight = True
         else:
             if cur_flight > best_flight:
                 best_flight = cur_flight
                 tilt_at_land = _tilt_deg(data)
+                best_forward = x - x_takeoff
             cur_flight = 0.0
 
         if trace is not None:
@@ -268,6 +354,7 @@ def simulate(
     if cur_flight > best_flight:              # still airborne at the end
         best_flight = cur_flight
         tilt_at_land = _tilt_deg(data)
+        best_forward = float(data.qpos[0]) - x_takeoff
 
     return Result(
         s_crouch=s_crouch,
@@ -279,6 +366,8 @@ def simulate(
         tilt_at_land_deg=tilt_at_land if saw_flight else 0.0,
         max_tilt_deg=max_tilt,
         landed_upright=saw_flight and tilt_at_land < 30.0,
+        s_push=s_push,
+        forward_m=best_forward if saw_flight else 0.0,
     )
 
 
@@ -318,6 +407,9 @@ def main() -> None:
     extends = [0.0, 0.1, 0.2, 0.3, 0.4]
     t_crouches = [0.15, 0.25, 0.40]
     t_extends = [0.03, 0.04, 0.06, 0.09, 0.14]
+    # Rearward push blended into the extension (S5): 0.0 reproduces the original
+    # vertical-only sweep, so the flight baseline is unchanged by this addition.
+    pushes = [0.0, 0.15, 0.30]
 
     # Sanity check first: if simply holding STAND does not settle upright, every
     # number below is meaningless. Upstream's CLAUDE.md calls this out directly.
@@ -326,6 +418,12 @@ def main() -> None:
     for idx in sorted(pattern):
         print("   act %2d %-16s %+.3f" % (
             idx, mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, idx), pattern[idx]))
+    push_pattern = leg_push_pattern(model, stand_qpos)
+    print("derived rearward push direction (+p = foot back -> trunk forward):")
+    for idx in sorted(push_pattern):
+        print("   act %2d %-16s %+.3f" % (
+            idx, mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, idx),
+            push_pattern[idx]))
     print()
 
     baseline = simulate(model, data, stand_ctrl, stand_qpos, pattern,
@@ -336,10 +434,12 @@ def main() -> None:
         for se in extends:
             for tc in t_crouches:
                 for te in t_extends:
-                    results.append(
-                        simulate(model, data, stand_ctrl, stand_qpos, pattern,
-                                 sc, se, tc, te)
-                    )
+                    for sp in pushes:
+                        results.append(
+                            simulate(model, data, stand_ctrl, stand_qpos, pattern,
+                                     sc, se, tc, te, s_push=sp,
+                                     push_pattern=push_pattern)
+                        )
 
     print(f"swept {len(results)} open-loop countermovements on {SCENE.name}")
     print(f"torque ceiling {model.actuator_forcerange[0][1]:.2f} Nm/joint, "
@@ -353,14 +453,17 @@ def main() -> None:
     print(f"{len(hops)} genuine hops, {len(topples)} contact-loss-by-toppling "
           f"(excluded), {len(results) - len(hops) - len(topples)} never left the floor\n")
 
-    hdr = (f"{'flight_ms':>10} {'rise_mm':>8} {'maxtilt':>8} {'landtilt':>9}   params")
+    hdr = (f"{'flight_ms':>10} {'fwd_mm':>8} {'rise_mm':>8} {'maxtilt':>8} "
+           f"{'landtilt':>9}   params")
     print(hdr)
     print("-" * len(hdr))
     for r in (hops or topples)[: args.top]:
-        print(f"{r.flight_s * 1e3:10.1f} {r.apex_rise_m * 1e3:8.1f} "
+        print(f"{r.flight_s * 1e3:10.1f} {r.forward_m * 1e3:8.1f} "
+              f"{r.apex_rise_m * 1e3:8.1f} "
               f"{r.max_tilt_deg:8.1f} {r.tilt_at_land_deg:9.1f}   "
               f"crouch={r.s_crouch:+.2f}/{r.t_crouch:.2f}s "
-              f"extend={r.s_extend:+.2f}/{r.t_extend:.2f}s")
+              f"extend={r.s_extend:+.2f}/{r.t_extend:.2f}s "
+              f"push={r.s_push:+.2f}")
     if not hops:
         print("(no genuine hops - showing the toppling runs for diagnosis)")
 
@@ -382,6 +485,33 @@ def main() -> None:
     print(f"best UPRIGHT simultaneous flight: {flight_ms:.1f} ms   {verdict}")
     print("NOTE: no BAM back-EMF, no backlash, no DR -> this is an OPTIMISTIC bound.")
     print("NOTE: open-loop only. PPO may find a countermovement this sweep cannot.")
+
+    # --- S5: forward baseline -------------------------------------------------
+    # The distance a hop travels open-loop, i.e. the no-learning figure that
+    # forward_flight_progress has to beat before "it hops forward" means
+    # anything. Same role the 34 ms flight number plays for the flight term.
+    print("\n--- S5 forward baseline (architecture doc) ---")
+    fwd = max(hops, key=lambda r: r.forward_m, default=None)
+    if fwd is None or fwd.forward_m <= 0.0:
+        print("no UPRIGHT hop travelled forward at all open-loop.")
+        print("=> any forward travel a policy finds is learned, not free.")
+    else:
+        print(f"best forward travel in an upright hop: {fwd.forward_m * 1e3:.1f} mm "
+              f"over {fwd.flight_s * 1e3:.0f} ms "
+              f"(push={fwd.s_push:+.2f}, crouch={fwd.s_crouch:+.2f}/{fwd.t_crouch:.2f}s, "
+              f"extend={fwd.s_extend:+.2f}/{fwd.t_extend:.2f}s)")
+        print(f"mean airborne forward speed: "
+              f"{fwd.forward_m / max(fwd.flight_s, 1e-6):.3f} m/s "
+              f"(compare FORWARD_VEL_CAP in microduck_hop_env_cfg.py)")
+        # Scale the pass mark off the only measured policy-vs-open-loop ratio we
+        # have: the prior-art hop reached 30-35 mm bilateral clearance where this
+        # probe's open-loop rise tops out at 7-11 mm, i.e. PPO bought ~3-4x. The
+        # same multiple on the forward baseline is what "learning added
+        # something real" looks like; 5 cm was asserted, not derived.
+        print(f"=> evidence-scaled S5 pass mark: >={fwd.forward_m * 3.0 * 1e3:.0f} mm "
+              f"per hop (3x this baseline, the multiple PPO bought on clearance)")
+        print(f"=> fail mark: <={fwd.forward_m * 1e3:.0f} mm is no better than free, "
+              f"i.e. learning added nothing")
 
     if args.csv:
         trace: list = []

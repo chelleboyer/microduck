@@ -7211,6 +7211,50 @@ def roulade_lateral_velocity_penalty(
 # bar before "Microduck can hop" means anything.
 
 
+def _hop_trunk_gate(
+    env: ManagerBasedRlEnv,
+    min_height: float,
+    max_tilt_deg: float,
+    settle_steps: int,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bool (num_envs,): trunk is upright AND risen AND past the settle window.
+
+    The screen every hopscotch term shares. Factored out so the terms cannot
+    drift apart — they only cover each other's exploits if they agree on what
+    counts as upright and off-the-ground, and a cfg test asserts they are
+    configured with matching values.
+
+    Each clause blocks a measured failure, not a hypothetical one:
+
+    - ``upright`` — a duck falling over loses both foot contacts and logs
+      excellent "air time". 384 of the S1 probe's apparent successes were
+      topples.
+    - ``risen`` — a duck sitting on its trunk can lift both feet while going
+      nowhere, scoring full marks on clearance alone.
+    - ``settled`` — a robot spawned clear of the floor passes every physical
+      gate on step 0 and would bank free reward at every reset.
+
+    Note the asymmetric NaN fallbacks: a non-finite orientation must read as
+    FALLEN (``nan=-1.0`` on cos_tilt), a non-finite height as ON THE GROUND
+    (``nan=0.0``). Collapsing both to 0.0 would make a NaN read as upright.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    quat = asset.data.root_link_quat_w
+    # cos(tilt) = R22 = 1 - 2(qx² + qy²)
+    cos_tilt = torch.nan_to_num(
+        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
+    )
+    return (
+        (cos_tilt > math.cos(math.radians(max_tilt_deg)))
+        & (z > min_height)
+        & (env.episode_length_buf > settle_steps)
+    )
+
+
 def simultaneous_flight(
     env: ManagerBasedRlEnv,
     sensor_name: str,
@@ -7262,24 +7306,10 @@ def simultaneous_flight(
     # Time since the LAST foot left the ground; 0 while any foot is down.
     flight_t = torch.nan_to_num(air_time, nan=0.0).min(dim=1).values
 
-    asset: Entity = env.scene[asset_cfg.name]
-    z = torch.nan_to_num(
-        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
-    )
-    quat = asset.data.root_link_quat_w
-    # cos(tilt) = R22 = 1 - 2(qx² + qy²)
-    cos_tilt = torch.nan_to_num(
-        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
-    )
-
     airborne = (flight_t > min_flight_s) & (flight_t <= max_flight_s)
-    upright = cos_tilt > math.cos(math.radians(max_tilt_deg))
-    risen = z > min_height
-    # A robot spawned clear of the floor is upright, at height, and touching
-    # nothing — it would bank free flight on step 0 of every episode.
-    settled = env.episode_length_buf > settle_steps
+    gate = _hop_trunk_gate(env, min_height, max_tilt_deg, settle_steps, asset_cfg)
 
-    out = (airborne & upright & risen & settled).float()
+    out = (airborne & gate).float()
 
     # Optional: scale by commanded hop intent, so an all-zero command (the
     # deployment idle state) means "stand" rather than "hop anyway". Left off
@@ -7343,16 +7373,199 @@ def bilateral_foot_clearance(
     lift = (foot_z.min(dim=1).values - rest_height) / span
     lift = lift.clamp(min=0.0, max=1.0)
 
+    gate = _hop_trunk_gate(env, min_trunk_height, max_tilt_deg, settle_steps, asset_cfg)
+    return lift * gate.float()
+
+
+# ==============================================================================
+# Hopscotch — S5: forward travel and landing quality
+# ==============================================================================
+#
+# The flight terms above answer "did it leave the ground". These answer the
+# brief's actual Success #1: "hops FORWARD and lands upright". Both halves were
+# unmeasured — every gate above screens the robot DURING flight, so a forward
+# hop that reliably face-plants scored exactly as well as one that stuck.
+
+
+def _hop_just_landed(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    min_flight_s: float,
+    window_s: float,
+) -> torch.Tensor:
+    """Bool (num_envs,): just touched down from a GENUINE simultaneous flight.
+
+    Stateless, read entirely from the contact sensor — deliberately, for the
+    same reason ``simultaneous_flight`` is: a term that accumulated its own
+    flight counter would have to be reset-aware, and getting that wrong is
+    silent.
+
+    Two sensor fields do the work:
+
+    - ``current_contact_time`` is per-foot time since THAT foot touched down,
+      and 0 while it is airborne. The MINIMUM across feet is therefore time
+      since the LAST foot landed — i.e. time since the robot was fully down —
+      and is > 0 only when both feet are down.
+    - ``last_air_time`` is per-foot duration of the last completed air phase.
+      The MINIMUM across feet is the shorter of the two, which is the part the
+      feet spent airborne TOGETHER.
+
+    ``min``, not ``max``, on both. Reading max would let an ordinary walking
+    stride — one foot swinging 200 ms while the other stays planted — qualify
+    as a landing from flight, which is the same reduction bug
+    ``test_min_across_feet_not_max`` guards in the flight term.
+
+    The ``min_flight_s`` condition is load-bearing beyond noise rejection: it
+    is what stops the landing reward degenerating into a general "stand
+    upright" bonus that double-pays alongside the inherited ``upright`` term.
+    """
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    last_air = sensor.data.last_air_time
+    contact_t = sensor.data.current_contact_time
+    assert last_air is not None, f"sensor {sensor_name!r} reports no last_air_time"
+    assert contact_t is not None, f"sensor {sensor_name!r} reports no contact time"
+
+    flew = torch.nan_to_num(last_air, nan=0.0).min(dim=1).values
+    since_td = torch.nan_to_num(contact_t, nan=0.0).min(dim=1).values
+    return (flew >= min_flight_s) & (since_td > 0.0) & (since_td <= window_s)
+
+
+def forward_flight_progress(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    vel_cap: float = 0.4,
+    min_flight_s: float = 0.02,
+    max_flight_s: float = 0.30,
+    min_height: float = 0.10,
+    max_tilt_deg: float = 30.0,
+    settle_steps: int = 2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Capped forward speed, paid ONLY while genuinely airborne. [0, 1].
+
+    Positive weight. This is encoding **E1** from the architecture doc:
+    forward intent is un-commanded for the spike, so travel is rewarded
+    directly rather than tracked against a commanded velocity.
+
+    Why gate on flight rather than reward forward velocity outright: the
+    velocity recipe this env inherits already pays for forward velocity via
+    ``track_linear_velocity``, and walking is a strictly easier way to earn it
+    than hopping. Multiplying by the flight condition means a walking or
+    running policy earns exactly zero here no matter how fast it goes — the
+    only way to collect is to be off the ground, moving forward, upright.
+
+    Capped at ``vel_cap`` because an uncapped speed reward is a jackpot: a
+    forward dive would out-earn every controlled hop. Backward flight pays
+    zero, not negative — this is a positive-weight term and a negative return
+    would break the sign invariant.
+
+    Body-frame forward velocity (``root_link_lin_vel_b[:, 0]``), NOT world +x:
+    "hop forward" means relative to where the duck is facing, and a world-frame
+    reward would pay a duck that drifts sideways after turning.
+
+    Pays nothing until flight exists, which is intended — ``bilateral_foot_
+    clearance`` is the dense ramp toward flight, and adding a second ground-
+    phase ramp here would just recreate the walking exploit.
+    """
+    from mjlab.sensor import ContactSensor
+    sensor: ContactSensor = env.scene[sensor_name]
+    air_time = sensor.data.current_air_time
+    assert air_time is not None, f"sensor {sensor_name!r} reports no air time"
+
+    flight_t = torch.nan_to_num(air_time, nan=0.0).min(dim=1).values
+    airborne = (flight_t > min_flight_s) & (flight_t <= max_flight_s)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    v_fwd = torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 0], nan=0.0)
+    # clamp BEFORE dividing: an unclamped negative would pay negative reward.
+    progress = v_fwd.clamp(min=0.0, max=vel_cap) / max(vel_cap, 1e-6)
+
+    gate = _hop_trunk_gate(env, min_height, max_tilt_deg, settle_steps, asset_cfg)
+    return progress * (airborne & gate).float()
+
+
+def hop_landing_quality(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    target_height: float = 0.1167,
+    height_std: float = 0.02,
+    upright_std: float = 0.3,
+    min_flight_s: float = 0.02,
+    landing_window_s: float = 0.15,
+    settle_steps: int = 2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """upright × height Gaussians, paid in the window after a real landing.
+
+    Positive weight, [0, 1]. The missing half of "hops forward AND LANDS
+    UPRIGHT": every other hopscotch gate measures the robot mid-flight, so
+    without this a hop that ends in a face-plant scores identically to one
+    that sticks.
+
+    Shape mirrors ``roulade_landing_sharp`` — two Gaussians times a gate —
+    with the roll-completion gate swapped for the landing latch.
+
+    ``target_height`` defaults to the MEASURED walk-model settle height
+    (116.7 mm), NOT the velocity env's ``nominal_height = 0.095``. That
+    constant is ~22 mm low and survives only because ``body_pose_tracking``
+    runs at weight 0; see docs/command-block.md. Re-measure after any model
+    revision — a 5 mm error here has cost this project days before.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+
+    quat = asset.data.root_link_quat_w
+    # NaN orientation must read as FALLEN, so the fallback is a large tilt.
+    tilt_sq = torch.nan_to_num(
+        2.0 * (quat[:, 1].pow(2) + quat[:, 2].pow(2)), nan=2.0
+    )
+    upright_g = torch.exp(-tilt_sq / (upright_std * upright_std))
+
     z = torch.nan_to_num(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
-    quat = asset.data.root_link_quat_w
-    cos_tilt = torch.nan_to_num(
-        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
-    )
-    gate = (
-        (z > min_trunk_height)
-        & (cos_tilt > math.cos(math.radians(max_tilt_deg)))
-        & (env.episode_length_buf > settle_steps)
-    )
-    return lift * gate.float()
+    height_g = torch.exp(-((z - target_height) / height_std) ** 2)
+
+    landed = _hop_just_landed(env, sensor_name, min_flight_s, landing_window_s)
+    settled = env.episode_length_buf > settle_steps
+    return upright_g * height_g * (landed & settled).float()
+
+
+def hop_landing_impact_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    free_speed: float = 0.5,
+    min_flight_s: float = 0.02,
+    impact_window_s: float = 0.04,
+    settle_steps: int = 2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Downward speed at touchdown beyond a free allowance. SELF-NEGATING.
+
+    **Returns ≤ 0, so it takes a POSITIVE weight** — the microduck convention
+    for ``*_penalty`` functions, which ``test_every_penalty_term_has_a_sign_
+    that_can_only_log_negative`` enforces on any reward key ending in
+    ``_penalty``. Note this is the OPPOSITE of ``roulade_overspeed_penalty``,
+    which returns positive and takes a negative weight; both styles exist in
+    this file. Getting it backwards here pays the policy to slam into the
+    ground.
+
+    ``free_speed`` is an allowance, not a target: a hop to the S1 probe's
+    ~11 mm apex lands at sqrt(2·g·0.011) ≈ 0.46 m/s, so a hop the robot can
+    currently actually perform costs nothing. Re-derive it if a trained policy
+    reaches a materially higher apex, or this taxes every real hop.
+
+    World-frame vz, unlike ``forward_flight_progress``'s body-frame forward
+    velocity — impact is against the ground, which is a world-frame fact.
+
+    The window is tight (~2 control steps at 50 Hz) so this samples the
+    touchdown itself rather than the whole settling phase, which would charge
+    for the descent long after the impact is over.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
+    excess = (-vz - free_speed).clamp(min=0.0)
+
+    landed = _hop_just_landed(env, sensor_name, min_flight_s, impact_window_s)
+    settled = env.episode_length_buf > settle_steps
+    return -excess * (landed & settled).float()

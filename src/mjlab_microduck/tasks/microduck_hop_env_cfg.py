@@ -60,6 +60,46 @@ make WALKING optimal, and several of its terms make walking beat hopping.
    the policy's capacity across two. Ranges stay NON-ZERO so the twist input
    neurons survive for the forward-hop curriculum that follows.
 
+THE FORWARD VARIANT (forward=True) — SPIKE S5
+---------------------------------------------
+Everything above describes the hop-in-place baseline, which is unchanged and
+stays registered as Mjlab-Hop-Flat-MicroDuck so backlash and forward A/Bs have
+a fixed reference. ``forward=True`` adds three more deviations and registers as
+Mjlab-HopForward-Flat-MicroDuck.
+
+S5 asks the brief's actual Success #1 — "hops FORWARD and lands upright" —
+which the prior art does NOT answer (vertical hop only, from a standing entry,
+explicitly not from a walking stride).
+
+8. **forward_flight_progress** (weight 1.5), encoding E1: capped forward speed
+   paid ONLY while airborne. Un-commanded by decision — E3 (commanded hop
+   distance in body_pose[0]) is Phase 1 work, and E3 is this term plus latching
+   plus command gating, so nothing here is throwaway. Gating on flight is what
+   makes it unfarmable: walking is a strictly easier way to earn forward
+   velocity than hopping, so an ungated version would just retrain the walker.
+
+9. **hop_landing_quality** (1.0) and **hop_landing_impact_penalty** (+0.5,
+   self-negating). Every other gate in this file screens the robot DURING
+   flight, so before these a forward hop that reliably face-planted scored
+   exactly as well as one that stuck. The impact term's weight is POSITIVE
+   because the function returns <= 0 — see its docstring, and note that
+   roulade's *_penalty functions use the opposite convention.
+
+10. **track_linear_velocity 2.0 -> 0.3.** THE fix that makes E1 reachable, and
+   the least obvious line in this file. The walker's tracking term
+   (weight 2.0, std sqrt(0.1) = 0.316) is inherited unchanged, and with this
+   env's near-zero commanded velocity it pays ~2.0/step for standing still and
+   2.0*exp(-(0.4/0.316)^2) = 0.41/step at 0.4 m/s. So hopping forward COSTS
+   ~1.6 reward/step against a forward term that can pay at most 1.5 — and
+   test_flight_is_the_dominant_reward caps every positive term below
+   simultaneous_flight's 5.0 anyway. E1 loses before it starts unless tracking
+   steps back. Kept non-zero (0.3) so it still discourages aimless drift.
+   This is CLAUDE.md's "compare reward mass, not weights" rule, exactly.
+
+   NOT fixed by widening the twist ranges: that is encoding E2, rejected in the
+   architecture doc because velocity tracking has a strictly easier solution
+   than hopping.
+
 COMMAND ENCODING
 ----------------
 Hop intent lives in **body_pose[2]** (the z component), per docs/command-block.md.
@@ -89,6 +129,7 @@ WITHOUT BAM back-EMF, so the realistic no-learning figure is lower.
 """
 
 import math
+from dataclasses import replace
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers import CurriculumTermCfg, RewardTermCfg
@@ -129,9 +170,28 @@ FOOT_REST_HEIGHT = 0.0029
 # Smoothness is introduced only after the skill exists (see docstring note 5).
 ACTION_RATE_KICKIN_ITER = 400
 
+# ── S5 / forward=True constants (docstring notes 8-10) ────────────────────────
+# Forward speed at which the E1 term saturates, m/s. Matched to the velocity
+# env's walking command ceiling; re-derive against the flight probe's measured
+# open-loop forward reach. Too low caps a good hop, too high leaves the term
+# flat across the achievable range and kills its gradient.
+FORWARD_VEL_CAP = 0.4
+# MEASURED walk-model settle height. NOT the velocity env's nominal_height
+# (0.095), which is ~22 mm low and survives only because body_pose_tracking
+# runs at weight 0 — see docs/command-block.md.
+LANDING_TARGET_Z = 0.1167
+LANDING_WINDOW_S = 0.15
+# Impact allowance: free-fall from the S1 probe's ~11 mm apex is ~0.46 m/s, so
+# a hop the robot can currently perform costs nothing.
+IMPACT_FREE_SPEED = 0.5
+IMPACT_WINDOW_S = 0.04
+# Down from the walker's 2.0. See docstring note 10 — this is the line that
+# makes E1 reachable at all.
+HOP_TRACK_LIN_VEL_WEIGHT = 0.3
+
 
 def make_microduck_hop_env_cfg(
-    play: bool = False, rough: bool = False
+    play: bool = False, rough: bool = False, forward: bool = False
 ) -> ManagerBasedRlEnvCfg:
     cfg = make_microduck_velocity_env_cfg(play=play, rough=rough)
 
@@ -204,6 +264,49 @@ def make_microduck_hop_env_cfg(
     cfg.rewards["angular_momentum"].weight = -0.005
     cfg.rewards["action_rate_l2"].weight = 0.0  # ramped by curriculum below
 
+    # ── S5: forward travel + landing quality (docstring notes 8-10) ───────────
+    if forward:
+        cfg.rewards["forward_flight_progress"] = RewardTermCfg(
+            func=microduck_mdp.forward_flight_progress,
+            weight=1.5,
+            params={
+                "sensor_name": "feet_ground_contact",
+                "vel_cap": FORWARD_VEL_CAP,
+                "min_flight_s": FLIGHT_MIN_S,
+                "max_flight_s": FLIGHT_MAX_S,
+                "min_height": FLIGHT_MIN_HEIGHT,
+                "max_tilt_deg": FLIGHT_MAX_TILT_DEG,
+            },
+        )
+
+        cfg.rewards["hop_landing_quality"] = RewardTermCfg(
+            func=microduck_mdp.hop_landing_quality,
+            weight=1.0,
+            params={
+                "sensor_name": "feet_ground_contact",
+                "target_height": LANDING_TARGET_Z,
+                "min_flight_s": FLIGHT_MIN_S,
+                "landing_window_s": LANDING_WINDOW_S,
+            },
+        )
+
+        # POSITIVE weight on a SELF-NEGATING function — the microduck
+        # convention, enforced for any *_penalty reward key by
+        # test_every_penalty_term_has_a_sign_that_can_only_log_negative.
+        cfg.rewards["hop_landing_impact_penalty"] = RewardTermCfg(
+            func=microduck_mdp.hop_landing_impact_penalty,
+            weight=0.5,
+            params={
+                "sensor_name": "feet_ground_contact",
+                "free_speed": IMPACT_FREE_SPEED,
+                "min_flight_s": FLIGHT_MIN_S,
+                "impact_window_s": IMPACT_WINDOW_S,
+            },
+        )
+
+        # The line that makes E1 reachable — docstring note 10.
+        cfg.rewards["track_linear_velocity"].weight = HOP_TRACK_LIN_VEL_WEIGHT
+
     # ── Curricula ─────────────────────────────────────────────────────────────
     # The velocity env ramps head_pose_bias from iter 600. Drop it: it is a
     # posture-precision tax on the head, and the head is a load-bearing part of
@@ -267,4 +370,15 @@ MicroduckHopRlCfg = RslRlOnPolicyRunnerCfg(
     save_interval=250,
     num_steps_per_env=NUM_STEPS_PER_ENV,
     max_iterations=50_000,
+)
+
+# S5. Identical hyperparameters to the baseline on purpose: the forward run is
+# an A/B against hop-in-place, and changing the optimizer at the same time as
+# the reward stack would confound it. Only the experiment/run names differ —
+# sharing them would overwrite the baseline's logs/<experiment_name>/ directory
+# and collide in wandb, destroying the comparison this variant exists for.
+MicroduckHopForwardRlCfg = replace(
+    MicroduckHopRlCfg,
+    experiment_name="hop_forward",
+    run_name="hop_forward",
 )

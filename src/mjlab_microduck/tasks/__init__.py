@@ -70,6 +70,7 @@ from .microduck_roulade_env_cfg import (
 from .microduck_hop_env_cfg import (
     make_microduck_hop_env_cfg,
     MicroduckHopRlCfg,
+    MicroduckHopForwardRlCfg,
 )
 from .backlash import make_backlash_variant
 
@@ -239,6 +240,16 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
+# HopForward — the S5 spike: can it hop FORWARD and land upright? The baseline
+# above is kept unchanged as the A/B reference for this one.
+register_mjlab_task(
+    task_id="Mjlab-HopForward-Flat-MicroDuck",
+    env_cfg=make_microduck_hop_env_cfg(forward=True),
+    play_env_cfg=make_microduck_hop_env_cfg(play=True, forward=True),
+    rl_cfg=MicroduckHopForwardRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
 # Backlash variants — ±1° serial gear play per servo + encoder-through-backlash
 # actuator feedback and joint obs (see tasks/backlash.py). Each family keeps its
 # base task's collision model: Velocity → robot_walk_backlash.xml,
@@ -262,6 +273,7 @@ _BACKLASH_TASKS = (
     ("Mjlab-Velocity-Rough-Backlash-MicroDuck", make_microduck_velocity_env_cfg, {"rough": True}, MicroduckRlCfg, _BL_WALK),
     # Hop mirrors Velocity's walk model, so backlash A/Bs stay unconfounded.
     ("Mjlab-Hop-Flat-Backlash-MicroDuck", make_microduck_hop_env_cfg, {}, MicroduckHopRlCfg, _BL_WALK),
+    ("Mjlab-HopForward-Flat-Backlash-MicroDuck", make_microduck_hop_env_cfg, {"forward": True}, MicroduckHopForwardRlCfg, _BL_WALK),
     ("Mjlab-VelStand-Flat-Backlash-MicroDuck", make_microduck_velstand_env_cfg, {}, MicroduckVelStandRlCfg, _BL_ALLCOL),
     ("Mjlab-VelStand-Rough-Backlash-MicroDuck", make_microduck_velstand_env_cfg, {"rough": True}, MicroduckVelStandRlCfg, _BL_ALLCOL),
     ("Mjlab-StandUp-Flat-Backlash-MicroDuck", make_microduck_standup_env_cfg, {}, MicroduckStandUpRlCfg, _BL_ALLCOL),

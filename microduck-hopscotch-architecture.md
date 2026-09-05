@@ -248,17 +248,29 @@ Question:      Can Microduck hop forward and land upright?
 Spike:         Extend the hop env with forward-progress-while-airborne (E1) plus a
                landing-quality term. ~1000-1500 iters @ 4096 envs on l4x1. ~$5-10/run,
                2-3 runs before re-planning.
-Decision rule: >=5 cm net displacement per hop, landing upright, repeatable over >=3
+Decision rule: >=25 mm net displacement per hop, landing upright, repeatable over >=3
                consecutive hops  -> forward-hop track; size cells to the measured
                                     distance; proceed to commanded distance (E3).
-               <1 cm, or upright landings <50%
-                                 -> the hop is vertical-only; hopscotch becomes
-                                    hop-in-place-into-cells, or the stepping pivot.
+               <=8 mm, or upright landings <50%
+                                 -> no better than open-loop; the hop is vertical-only,
+                                    and hopscotch becomes hop-in-place-into-cells or
+                                    the stepping pivot.
 ```
 
-The 5 cm threshold is a **placeholder pending measurement** against foot length and body height — it is
-asserted, not derived, and should be pinned down before the run is judged. Measure displacement between
-takeoff and landing, and measure uprightness by **tilt**, not height.
+**The threshold is now measured, not asserted** (2026-09-04, session 3). The extended CPU probe sweeps a
+rearward push blended into the extension and reports the open-loop forward baseline:
+**8.0 mm of travel per hop, over a 38 ms flight, at a mean airborne speed of 0.211 m/s.** Two consequences:
+
+- **The original 5 cm placeholder was ~6x beyond anything open-loop physics delivers**, and would have
+  failed a genuinely successful run. It is withdrawn.
+- **25 mm is scaled off the only measured policy-vs-open-loop ratio available**: the prior-art hop reached
+  30-35 mm bilateral clearance where this probe's open-loop rise tops out at 7-11 mm — PPO bought ~3-4x.
+  The same multiple on the forward baseline is what "learning added something real" looks like. The fail
+  mark is the baseline itself: matching 8 mm means learning added nothing.
+
+Also measured: adding the rearward push **improved flight from 32 ms to 42 ms**, so the push direction is
+not merely a forward lever — it finds better hops outright. Measure displacement between takeoff and
+landing over the flight interval only, and measure uprightness by **tilt**, not height.
 
 **S6 — Is perception worth breaking the 61D contract for?** *(deferred; trigger: S5 passes)*
 Only meaningful once a forward hop exists. Give the actor course-relative observations (or mjlab's native
