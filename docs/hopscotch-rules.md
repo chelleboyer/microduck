@@ -101,9 +101,13 @@ real run:
 PYTHONIOENCODING=utf-8 uv run train Mjlab-HopForward-Flat-MicroDuck \
     --env.scene.num-envs 64 --agent.max_iterations 5 --hf-jobs
 
-# THEN the real run (~1500 iters, ~$5-10 on l4x1):
+# THEN the real run (~1500 iters, ~$5-10 on l4x1).
+# NOTE `--video True`, not a bare `--video`: mjlab parses train args with tyro,
+# which wants an explicit value and exits 2 with "Missing value for argument
+# ('--video',)" without one. hf_jobs' own _wants_video() accepts the bare form,
+# so the osmesa GL setup looks right and the job still dies in arg parsing.
 PYTHONIOENCODING=utf-8 uv run train Mjlab-HopForward-Flat-MicroDuck \
-    --env.scene.num-envs 4096 --agent.max_iterations 1500 --hf-jobs --video
+    --env.scene.num-envs 4096 --agent.max_iterations 1500 --hf-jobs --video True
 ```
 
 The smoke test only proves it builds, steps NaN-free, all terms compute and ONNX exports — 5
