@@ -6,7 +6,7 @@ Face Jobs. **Sim-only** as of session 3; hardware is deferred, not dropped (see 
 > **Start here (fresh session).** Read this file, then
 > [`../microduck-hopscotch-architecture.md`](../microduck-hopscotch-architecture.md) (decisions) and
 > [`hopscotch-routine.md`](./hopscotch-routine.md) (what we're ultimately building). Current state and
-> the next action are in **Session 5 — START HERE** below. Everything after that section is standing
+> the next action are in **Session 6 — START HERE** below. Everything after that section is standing
 > context; everything in it is live.
 
 ## Scope (session 3, 2026-09-04)
@@ -18,7 +18,37 @@ them is a one-way door. What the scope change actually unlocks is that two hardw
 now ours to flip if we want them: mjlab's native `height_scan`, and promoting `base_lin_vel` from
 critic-only to the actor. Neither is flipped yet — see S6 in the architecture doc.
 
-## Session 6 — START HERE (state as of 2026-09-06, end of session 5)
+## Session 6 — START HERE (state as of 2026-09-06, opened session 6)
+
+**Nothing has run since S5.4.** Working tree clean, 2 commits ahead of `origin/develop` (`4f1e836`
+S5.4, `21cdb13` the renderer), 368 CPU tests green in ~13 s. No new training submitted.
+
+Session 6 opened by re-measuring rather than by changing rewards, and that turned up **two findings
+that reorder the next steps below**. Both are recorded in full in "The instrument problem" and "The
+heading term is unobservable" sections that follow. The short version:
+
+1. **The eval battery's per-second metrics are measuring the first ~1.1 s of an 8 s episode**, because
+   it stops the clock at the fall — and its fall rate is the one number the project already agreed not
+   to trust. `hops per cycle` and `heading drift deg/s` are both normalised by that truncated window,
+   so both remaining failing requirements are currently being judged on a contaminated instrument.
+2. **`heading_hold` prices a quantity the actor cannot observe.** Absolute heading is not in the 61D
+   obs and the network has no memory, so the policy cannot steer back to a heading it cannot see.
+   Raising `HEADING_HOLD_WEIGHT` — the previous session's first recommendation — pushes harder on a
+   loop that cannot close. **Do that only together with the observability fix.**
+
+### Next steps, in order
+
+| # | Action | Why it is first |
+|---|---|---|
+| 1 | **Port `hop_eval.py`'s measurements onto `render_policy.py`'s BAM path** | Both open requirements are measured by contaminated numbers. Free, local, CPU, and the BAM setup is already proven (`scripts/infer_policy.py:load_mujoco_with_bam`). Do not tune cadence against 7.51 hops/cycle until this lands |
+| 2 | **Make heading observable, then reprice it** | Write the wrapped heading error into the free twist slot (`mdp.py:5000` hard-zeros `vel_command_b[:, 2]` under the phase carrier — a spare input inside the 61D contract). Then `HEADING_HOLD_WEIGHT` 1.5 → ~3.5 is a real dial rather than added variance |
+| 3 | **Re-measure cadence, then fix the design gap** | The gap the last session named is real — the cadence factor removes the *reward* for extra hops but never *charges* for them. Judge it on **takeoff phase lock (0.34)**, which is duration-free, not on hops/cycle |
+
+Items 1 and 2 are independent and can land in either order; item 3 depends on item 1.
+
+---
+
+## What S5.4 achieved (end of session 5)
 
 **S5.4 ran and the duck HOPS.** User's verdict on the video: *"that's a hop! not perfect but a hop
 nonetheless."* First time in the project that the behaviour has been called a hop rather than a bounce,
@@ -61,36 +91,108 @@ The rest, all at unchanged weights unless noted:
 weight went 10 → 25 while the cadence cut the duty cycle ~10×, so raw is 0.036 vs 0.397. Judge it
 against the cadence, not the level.
 
-### What S5.4 did NOT fix — this is the next session's work
+### What S5.4 did NOT fix
 
-1. **Heading is still drifting: +107.5 → +62.8 deg/s.** Better by 42%, still a full circle every
-   ~5.7 s, and `heading_hold` plateaued at **0.315 of a possible 1.5** (~21%). The weight was too
-   weak. **First thing to try: `HEADING_HOLD_WEIGHT` 1.5 → ~3.5.** It is now the only one of the
-   user's four requirements still failing outright.
-2. **Cadence barely moved: 8.71 → 7.51 hops/cycle**, phase lock 0.23 → 0.34. Diagnosis: the cadence
-   factor removes the *reward* for extra hops but never *charges* for them, so bouncing is still free
-   apart from `action_rate`. That is a design gap, not a tuning one — the fix is to make an off-beat
-   takeoff cost something, or to pay the hold enough that hopping off-beat loses to standing.
-   **Caveat: training's `hop_settle` (5.4× up) disagrees with the battery's 7.5 hops/cycle. That
-   conflict is the actuator gap below, and it should be resolved before acting on point 2.**
+1. **Heading is still drifting: +107.5 → +62.8 deg/s** (but see the caveat on that unit below), and
+   `heading_hold` plateaued at **0.315 of a possible 1.5**. It is the only one of the user's four
+   requirements still failing outright. **The reason is observability, not weight — see below.**
+2. **Cadence barely moved.** Takeoff phase lock 0.23 → 0.34 against a 1.00 target. The design gap is
+   real: the cadence factor removes the *reward* for extra hops but never *charges* for them, so
+   bouncing is still free apart from `action_rate`. The fix is to make an off-beat takeoff cost
+   something, or to pay the hold enough that hopping off-beat loses to standing.
 
-### The instrument problem, and the tool that can now fix it
+### The instrument problem — worse than "forward travel is untrustworthy" (session 6)
 
 Three measurements of the same policy disagree, and the disagreement is systematic:
 
 | Harness | Actuators | Says |
 |---|---|---|
 | Training (mjlab/warp) | BAM + DR + noise + delay | episodes run 914/1000 steps (~18 s) |
-| `render_policy.py` (new) | BAM, no DR/noise/delay | S5.4 fell at 6.62 s of 8 s |
+| `render_policy.py` | BAM, no DR/noise/delay | S5.4 fell at 6.62 s of 8 s |
 | `hop_eval.py` | **position servos** | **100% of episodes fall** |
 
-The ordering is monotonic in actuator fidelity, which is the tell. **Porting `hop_eval.py`'s
-measurements onto `render_policy.py`'s BAM path is the single highest-value piece of tooling work
-left**, and it is now small: the BAM setup is proven to work on CPU here
-(`scripts/infer_policy.py:load_mujoco_with_bam`, exercised by `tests/test_infer_policy_bam.py`, and
-used by the renderer). Until that lands, treat the battery's fall rate and hop count as suspect too —
-not just its forward travel. A residual sim-to-sim gap will remain regardless (CPU MuJoCo has no DR,
-observation noise or command delay), so BAM-on-CPU is a better instrument, not a perfect one.
+The ordering is monotonic in actuator fidelity, which is the tell. What session 6 added is **how far
+that contaminates the report**, and it is further than the previous session assumed.
+
+`hop_eval.py` **breaks out of the episode loop when tilt exceeds 70°** (`hop_eval.py:399-401`), and
+then divides the per-second metrics by the elapsed time (`policy_s`, `hop_eval.py:519-525`). So a
+harness that falls early does not merely report a bad fall rate — it reports every rate over a short
+and self-selected window. Backing the number out of S5.4's own report:
+
+```
+102 genuine hops / 7.51 per cycle = 13.58 cycles x 1.6 s = 21.7 s across 20 episodes
+                                  = 1.09 s per episode, of a nominal 8 s
+```
+
+**The battery is characterising the first 1.1 seconds of behaviour** — 14% of its own episode, and
+~6% of the 18.3 s episodes training actually runs. At 5.10 hops in 1.09 s that is one takeoff every
+213 ms with a median 32 ms flight: the drop-in transient and the topple, not steady state. That is
+why "7.51 hops/cycle" disagrees with training's `hop_settle` rising 5.4×. **Both were right about
+different windows.** The conflict the last session flagged is now explained.
+
+**The corrected trust table** (this supersedes the one in "The eval battery" section below):
+
+- **Trust — duration-free** (a ratio, a per-hop statistic, or a circular statistic): takeoff phase
+  lock, air-vs-ground travel share, landing tilt, upright landing rate.
+- **Do NOT trust — divided by the truncated window**: `hops per cycle`, `heading drift deg/s`,
+  whole-run head error (a per-step mean over the same window), and best-consecutive (a count the
+  fall cuts short).
+- **Do NOT trust — the actuator gap directly**: forward travel per hop, apex rise, fall rate.
+
+That leaves **takeoff phase lock as the only trustworthy cadence number in the report**, and it says
+0.34 — cadence is genuinely failing, we just cannot currently size by how much.
+
+So item 1 in the next-steps table is not a nice-to-have: it is the instrument for both remaining
+requirements. A residual sim-to-sim gap will remain regardless (CPU MuJoCo has no DR, observation
+noise or command delay), so BAM-on-CPU is a better instrument, not a perfect one.
+
+### The heading term prices something the policy cannot see (session 6)
+
+`heading_hold_reward` (`mdp.py:4874`) rewards `exp(-wrap(yaw - yaw_spawn)² / std²)`. The actor's
+observation, dumped from the built cfg, is:
+
+```
+base_ang_vel(3)  projected_gravity(3)  joint_pos(14)  joint_vel(14)  actions(14)   = 48
++ twist(3, phase carrier)  head_command(4)  body_command(6)                        = 61
+```
+
+**Absolute heading is in none of it.** `projected_gravity` is yaw-invariant by construction — rotating
+about the world z axis does not change the gravity projection — and `base_ang_vel` is the gyro, which
+gives yaw *rate* only. The actor is a plain MLP (`hidden_dims=(512, 256, 128)`, no recurrence), so it
+cannot integrate that rate into a heading estimate either. Spawn yaw is randomised full-circle, so
+even the reference direction is unknowable.
+
+Three consequences, and they explain the plateau exactly:
+
+- **The policy cannot steer back**, which is the entire argument the docstring makes for choosing an
+  angle-based term over a yaw-rate penalty. The only thing it *can* learn is to remove a systematic
+  yaw bias from its gait — which is precisely what a yaw-rate penalty asks for. **The instrument has
+  degenerated into the tool it was chosen over.**
+- **The critic cannot see it either** (its extra terms are `base_lin_vel`, foot contacts — none
+  yaw-bearing), so this term is unpredictable from the value function's input. It therefore enters
+  the advantage as variance rather than signal. **Raising the weight 1.5 → 3.5 scales that noise**,
+  which is an argument that the obvious next move would make learning worse, not merely ineffective.
+- **The measured plateau is about what chance predicts.** Raw `heading_hold` is 0.315/1.5 = 0.210.
+  A yaw scattered uniformly around the circle scores 0.113 at std 0.4; a held heading scores 1.0. The
+  policy captured **11% of the range above chance** — consistent with "shaved some bias off, then
+  stopped", and not with "the weight is nearly enough".
+
+This is the same lesson S5.4 already booked, applied one level down: *when a term will not move, find
+out what is actually happening before raising the price.* There it was a buyer elsewhere; here it is
+a policy that is blind to what it is being charged for.
+
+**The fix is free and stays inside the 61D contract.** `GroundPickPhaseCommand.compute` hard-zeros
+the third twist slot (`mdp.py:5000`: `vel_command_b[:, 2] = 0.0`) — the phase carrier only needs two
+slots for `[cos, sin]`. That third slot is a live input neuron carrying a constant, i.e. a wasted
+input the standing rules already warn about. Writing `wrap(yaw - yaw_spawn)` (or its sine, which is
+smooth across the wrap) there makes `heading_hold` a closable loop at zero cost to the observation
+contract and zero risk to policy hot-swapping. It is also not a sim-only cheat: the real robot can
+integrate its gyro for the ~18 s of an episode, so this does not spend the deferred hardware path.
+
+**Do not treat this as decided** — it is a session-6 diagnosis, not a trained result. The cheap A/B
+is the observability fix at the *current* weight, so the next run reads cleanly on whether
+observability was the blocker, exactly as S5.4 held the head weights fixed to read cleanly on
+steering.
 
 ### Deliberately abandoned (2026-09-06)
 
@@ -108,14 +210,15 @@ observation noise or command delay), so BAM-on-CPU is a better instrument, not a
 Watching the S5.3 run's video: *"he's kind of hopping, but more scooting himself around in a circle"*,
 and the target is **"he needs to hop straight ahead, pause and then repeat, all with his head up."**
 
-Four properties, and the honest status of each after four forward runs:
+Four properties, and the honest status of each **after S5.4** (the previous version of this table was
+S5.3-era; each row now cites an instrument that survives the session-6 audit above):
 
-| Requirement | Status | Why |
+| Requirement | Status | Evidence, and which instrument |
 |---|---|---|
-| **Hop** (leaves the ground) | partial | Genuine flight exists, but it is shallow and most travel is on the ground |
-| **Straight ahead** | **failing** | Heading drifts **+107 deg/s** — a full circle every ~3.4 s. Nothing has priced yaw since S5.3 |
-| **Pause, then repeat** | **failing** | **8.7 hops per 1.6 s cycle**; the phase clock is being ignored. Third attempt, third failure |
-| **Head up** | **failing** | `head_pose_bias` is *diverging* under weight 3.0; harness measures 21.3° mean head error |
+| **Hop** (leaves the ground) | **partial — and the user calls it a hop** | 66% of travel still happens with a foot down (air-share, a ratio → trustworthy). Airborne fraction 27% → 12% in training |
+| **Straight ahead** | **failing** | `heading_hold` raw 0.210 vs 0.113 chance and 1.0 held — **from wandb, not the battery**, so it is clean. Only 11% of the range above chance. Root cause is observability, not weight |
+| **Pause, then repeat** | **failing** | Takeoff phase lock 0.23 → 0.34 of 1.00 (circular statistic → duration-free → trustworthy). The "hops per cycle" figure is **not** trustworthy — see the instrument problem |
+| **Head up** | **fixed, as a side effect** | Per-joint error collapsed with no head change at all: neck_pitch −20.4° → −2.0°, head_pitch +28.1° → +5.6°, head_yaw +21.1° → +4.4° |
 
 ### The runs so far (all `Mjlab-HopForward-Flat-MicroDuck`, 4096 envs)
 
@@ -124,10 +227,12 @@ Four properties, and the honest status of each after four forward runs:
 | S5 | `s5-forward-hop`, 1500 it | — | `chelleboyer/s5-forward-hop` | Forward bunny hop, confirmed on video. Airborne 52% of its life |
 | S5.1 | 1500 it | `5b77zi33` | `chelleboyer/s51-forward-hop` | Displacement-at-landing replaces air time |
 | S5.2 | ~700 it (crashed at 692) + rerun | `8j6xu1nk` | `chelleboyer/s52-head-rhythm` | Head to walker strength; pause-scaled hop. **Rhythm failed measurably** |
-| **S5.3** | **2500 it, COMPLETED** | **`tbs1k86h`** | **`chelleboyer/s53-phase-hop`** | Phase cycle + crouch + apex. **Crouch works; rhythm and heading do not** |
+| S5.3 | 2500 it, COMPLETED | `tbs1k86h` | `chelleboyer/s53-phase-hop` | Phase cycle + crouch + apex. **Crouch works; rhythm and heading do not** |
+| **S5.4** | **1500 it, COMPLETED** | **`bb8t7j2e`** | **`chelleboyer/s54-heading-cadence-v2`** | Heading hold + binding cadence + repricing. **The user calls it a hop. Head fixed as a side effect; heading and cadence still failing** |
 
 `chelleboyer/s53-phase-hop` holds 11 checkpoints, 21 videos and `exported/policy.onnx` — the in-job
-auto-export is confirmed working end to end. Local copies: `logs/s53/`.
+auto-export is confirmed working end to end. Local copies: `logs/s53/`, `logs/s54/` (the latter also
+holds `S54-bam-720p.mp4` and `S54-slowmo.mp4` from the local renderer, plus `eval_final.json`).
 
 ### What last night's run (S5.3) actually shows
 
@@ -282,18 +387,19 @@ verdict rather than an error**:
   `USE_PROJECTED_GRAVITY = True`. The only tell was a physically impossible 0.0 mm apex rise.
   **Trust the impossible number, not the verdict.**
 
-**Still open — the actuator gap.** It drives plain MJCF **position servos**; training drives **BAM**
-(voltage model, back-EMF). On the S5 policy it reported −2.2 mm/hop while training logged ~95% of the
-velocity cap and the video plainly showed forward hopping.
+**Still open — the actuator gap, and it reaches further than this section used to claim.** The harness
+drives plain MJCF **position servos**; training drives **BAM** (voltage model, back-EMF). On the S5
+policy it reported −2.2 mm/hop while training logged ~95% of the velocity cap and the video plainly
+showed forward hopping.
 
-- **Do not trust:** forward travel per hop, apex rise, and (new evidence) **fall rate** — the S5.3 run
-  held 910–960-step episodes under BAM while the harness ended 100% of episodes fallen. That
-  contradiction is the actuator gap talking, not the policy.
-- **Do trust:** hop count, hops per cycle, takeoff phase lock, heading drift, the air-vs-ground share
-  of travel (both halves measured identically, so the ratio survives), and landing tilt. Geometry and
-  contact, not torque.
+**The trust table lives in "The instrument problem" above and supersedes what used to be here.** The
+correction session 6 made: an earlier version of this list put *hops per cycle* and *heading drift* in
+the "do trust" column on the grounds that they are geometry and contact rather than torque. That is
+true of the numerators and false of the denominators — both are divided by an elapsed time the fall
+truncates, and the fall is the untrusted quantity. **Anything per-second in this report inherits the
+actuator gap.** Per-hop statistics, ratios and the circular phase-lock statistic do not.
 
-Closing that gap — or accepting it permanently — is still an open task.
+Closing that gap — or accepting it permanently — is the top item in the next-steps table.
 
 ## Tooling (all CPU, all free)
 

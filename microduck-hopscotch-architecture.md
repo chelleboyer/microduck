@@ -131,6 +131,19 @@ for. Answer: **nothing, for now.** BAM, the backlash twins and domain randomizat
 If training later stalls, a DR-off ablation is a cheap **diagnostic**, and is named here as a lever rather
 than adopted as a decision. **S4 (reality gap) is deferred, not deleted.**
 
+**A free command slot exists, and heading error is what should go in it.** *(session 6, proposed —
+not yet trained)* Making the actor's heading error observable does **not** require breaking the 61D
+contract, because the phase carrier does not use all the room it was given:
+`GroundPickPhaseCommand.compute` writes `[cos 2πφ, sin 2πφ, 0]` and hard-zeros the third twist slot
+(`mdp.py:5000`). That slot is a live input neuron fed a constant — exactly the dead-weight condition
+the command rules exist to prevent. Writing `wrap(yaw − yaw_spawn)` (or its sine, smooth across the
+wrap) there turns `heading_hold` from an unclosable loop into a steerable one at zero cost to
+hot-swappability. It also does not spend the deferred hardware path: the real robot can integrate its
+gyro over the ~18 s of an episode, so this is a *deployable* observation, unlike `height_scan`.
+Recorded as the recommended next experiment rather than a settled decision — the clean A/B is to
+change observability at the current weight, so the run reads as a test of the hypothesis, exactly as
+S5.4 held the head weights fixed to read cleanly on steering.
+
 **Observation & command contract — stay at 61D for now, as a deferred decision.** The contract costs
 almost nothing today: hop intent already fits `body_pose[2]`, and the spike does not need to aim. It
 starts costing the moment we want closed-loop cell placement. Recorded explicitly so nobody mistakes it
@@ -242,30 +255,42 @@ Built since session 3 and no longer missing: the E1 forward-progress reward, lan
 (`hop_landing_quality` + `hop_landing_impact_penalty`), the flight→displacement handover curriculum, the
 headless evaluation battery, and training video that survives the job (osmesa, plus the uploader glob).
 
-Still missing, in dependency order:
+Built since session 4 and no longer missing: the heading constraint (`heading_hold`), the binding
+cadence factor, and the head-posture instrument — the last of which was resolved not by building it
+but by removing the cause (S5.4's steering finding).
 
-- **A heading constraint.** Nothing prices yaw since S5.3 deleted `track_angular_velocity`. This is the
-  single largest gap between what the policy does and what was asked for.
-- **A binding cadence.** The phase clock exists and is ignored, because no hop payment is gated on it.
-- **An instrument for head posture across the cycle**, as opposed to another weight increase on a term
-  that is already diverging.
-- **A trustworthy off-policy measurement of forward travel** — i.e. closing the eval battery's actuator
-  gap (position servos vs BAM), or accepting permanently that only wandb and the video can answer "did
-  it travel".
+Still missing, in dependency order (revised session 6):
+
+- **An OBSERVABLE heading error.** `heading_hold` was added in S5.4 and prices `wrap(yaw − yaw_spawn)`
+  — a quantity that is **not in the 61D observation** and cannot be reconstructed from it: the actor
+  sees only yaw *rate* (gyro) and a yaw-invariant gravity vector, in a memoryless MLP. The constraint
+  therefore exists but cannot be closed by the policy, which is why it plateaued at 11% of the range
+  above chance. See the decision below; the fix does **not** cost the 61D contract.
+- **A cadence that CHARGES.** The clock is now binding for the terms that pay, but an off-beat takeoff
+  still costs nothing beyond `action_rate` — the factor removes reward without imposing cost.
+- **A trustworthy off-policy measurement** — broader than session 5 recorded. The eval battery's
+  actuator gap (position servos vs BAM) does not only corrupt forward travel: because the harness
+  stops the clock at the fall and divides by elapsed time, **every per-second metric inherits the
+  untrusted fall rate**, including the two that measure the remaining failing requirements. Ratios,
+  per-hop statistics and the circular phase-lock statistic are unaffected. This is now the gating
+  tooling task, and it is small — the BAM-on-CPU path is already proven by `render_policy.py`.
 - *(deferred, approach-dependent)* Course terrain geometry; course-relative observations; the choreography
   itself; painted markers.
 
 ## Spikes & experiments
 
-**S5 — Can Microduck hop forward and land upright?** *(four runs in; PARTLY ANSWERED, still open)*
+**S5 — Can Microduck hop forward and land upright?** *(five runs in; PARTLY ANSWERED, still open)*
 
-**Status as of 2026-09-06.** Yes to flight, yes to landing upright (98% of landings, median 8.5° tilt,
-episodes running 910–960 steps under BAM). **Not yet** to "forward" in the sense the brief means it: the
-policy scoots and circles more than it travels through the air. The spike stays open, but its question
-has narrowed from *"can it?"* to *"can the reward stack ask for it precisely enough?"* — which is a
-tuning problem, not a physics one, and that itself is a result worth recording. The decision rule below
-cannot be evaluated yet, because the only instrument that measures per-hop displacement off-policy (the
-eval battery) is not trustworthy on forward travel — see the actuator gap in `docs/hopscotch-rules.md`.
+**Status as of 2026-09-06 (session 6).** Yes to flight, yes to landing upright (98% of landings,
+median 7.4° tilt, episodes running ~914/1000 steps under BAM), and after S5.4 the user calls the
+behaviour a hop. **Not yet** to "forward" in the sense the brief means it: 66% of travel still happens
+with a foot on the floor. The spike stays open, and its question has narrowed twice — first from
+*"can it?"* to *"can the reward stack ask for it precisely enough?"*, and now, in part, to **"can we
+measure it well enough to tell?"** The decision rule below still cannot be evaluated, and session 6
+widened the reason: it is not only that the eval battery mis-measures forward travel under position
+servos, but that it stops the clock at the fall, so **every per-second metric in the report inherits
+the untrusted fall rate**. Fixing the instrument now precedes further reward tuning — see
+`docs/hopscotch-rules.md`.
 
 The brief's Success #1, and the one question every approach depends on. Prior art does **not** answer it:
 its own model card reports a vertical hop from a standing entry and states it was *"not trained to take off
@@ -378,13 +403,19 @@ the hop-in-place baseline remains the untouched A/B reference. Results, and what
 
 This is the acceptance criterion for the forward hop, and it is more specific than Success #1 in the
 brief ("hops forward and lands upright"). It decomposes into four properties, which is useful because
-each one is a separate reward question, and after four runs only the first is partly satisfied:
+each one is a separate reward question. **Status after five runs (updated session 6):**
 
-1. **Hop** — leaves the ground. Partly: flight exists but is shallow, and two thirds of the travel
-   happens with a foot on the floor.
-2. **Straight ahead** — heading held. **No**: +107 deg/s of drift, a full circle every ~3.4 s.
-3. **Pause, then repeat** — a cadence, not a buzz. **No**: 8.7 hops per 1.6 s cycle.
-4. **Head up** — throughout, not just at touchdown. **No**: the bias penalty is diverging.
+1. **Hop** — leaves the ground. Partly, and the user now calls it a hop: flight is genuine but shallow,
+   and two thirds of the travel still happens with a foot on the floor.
+2. **Straight ahead** — heading held. **No**: `heading_hold` sits at 11% of the range above chance.
+   Root cause identified in session 6 as **observability**, not weight — the actor cannot see its
+   heading error.
+3. **Pause, then repeat** — a cadence, not a buzz. **No**: takeoff phase lock 0.34 of 1.00. (The
+   "8.7 hops per cycle" figure this line used to carry is not a trustworthy magnitude — see the
+   instrument correction.)
+4. **Head up** — throughout, not just at touchdown. **YES, since S5.4** — and fixed without touching a
+   head weight. The head was being used to steer; constraining the heading collapsed the counter-fold
+   (neck_pitch −20.4° → −2.0°, head_pitch +28.1° → +5.6°, head_yaw +21.1° → +4.4°).
 
 **Decision: heading and cadence become first-class reward objectives, not emergent hopes.** Three runs
 assumed each would fall out of a travel reward, and none did. The evidence:
@@ -415,6 +446,21 @@ policy stop moving entirely.
 
 ## Revision history
 
+- **2026-09-06, session 6 (open)** — **no run; the session opened by re-measuring, and found two
+  instrument problems rather than two reward problems.** (1) The eval battery breaks out of the
+  episode at the fall and divides its rate metrics by elapsed time, so S5.4's report characterises
+  **1.09 s of a nominal 8 s** (derived: 102 hops ÷ 7.51 per cycle × 1.6 s ÷ 20 episodes) — ~6% of the
+  18.3 s episodes training runs. `hops per cycle` and `heading drift deg/s` therefore inherit the fall
+  rate the project had already ruled untrustworthy, which is what reconciles them with training's
+  5.4× rise in `hop_settle`. The trust table is corrected: only ratios, per-hop statistics and the
+  circular phase-lock statistic survive. (2) `heading_hold` prices `wrap(yaw − yaw_spawn)`, which the
+  actor cannot observe — no absolute heading in the 61D obs, gyro gives rate only, gravity is
+  yaw-invariant, and the MLP has no memory to integrate with. The term therefore degenerates into the
+  yaw-rate penalty its own docstring rejects, is invisible to the critic (so it adds advantage
+  variance rather than signal), and sits at 11% of the range above chance — meaning the planned
+  `HEADING_HOLD_WEIGHT` 1.5 → 3.5 would scale noise. **Both open requirements were being judged on
+  contaminated instruments, so the next steps are re-ordered: fix the instrument, then make heading
+  observable via the free third twist slot, then re-measure cadence.**
 - **2026-09-06, session 5 (end)** — **S5.4 ran, and the behaviour is a hop.** User's verdict on the
   video: *"that's a hop! not perfect but a hop nonetheless"* — the first time this project's output has
   been called a hop rather than a bounce, buzz or scoot. **The head result is the transferable

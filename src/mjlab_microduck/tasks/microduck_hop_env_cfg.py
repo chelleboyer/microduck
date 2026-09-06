@@ -412,6 +412,33 @@ FLIGHT_WEIGHT_S53 = 0.25
 # and the policy can steer BACK to recover it. Its docstring is explicit that a
 # yaw-RATE penalty is the wrong tool: it says "never turn", which cannot correct
 # a drift once it has happened.
+#
+# *** CORRECTED 2026-09-06 (session 6), BEFORE RAISING THIS WEIGHT. ***
+# That rationale holds only where the policy can OBSERVE its heading error, and
+# in this env it cannot. The 61D actor obs is base_ang_vel (gyro: yaw RATE only)
+# + projected_gravity (yaw-INVARIANT by construction) + joint_pos/vel + actions
+# + commands. Absolute heading appears nowhere, spawn yaw is randomised
+# full-circle, and the actor is a memoryless MLP, so it cannot integrate the
+# rate into a heading estimate either. Three consequences, all measured on the
+# S5.4 run (wandb bb8t7j2e):
+#   - The policy cannot steer back. The only thing it CAN learn is to remove a
+#     systematic yaw bias — i.e. this term has degenerated into exactly the
+#     yaw-rate penalty the docstring rejects.
+#   - The critic is equally yaw-blind, so the term is unpredictable from the
+#     value input and enters the advantage as VARIANCE, not signal. Raising the
+#     weight scales the noise.
+#   - It plateaued at raw 0.210, against 0.113 for a yaw scattered uniformly
+#     around the circle at this std and 1.0 for a held heading — 11% of the
+#     range above chance, which is "shaved off some bias then stopped", not
+#     "nearly enough weight".
+# THE FIX IS OBSERVABILITY, AND IT IS FREE: GroundPickPhaseCommand.compute
+# hard-zeros the third twist slot (mdp.py:5000) because the phase carrier only
+# needs two for [cos, sin]. Writing wrap(yaw - yaw_spawn) — or its sine, smooth
+# across the wrap — into that slot makes this a closable loop at zero cost to
+# the 61D contract, and stays deployable (the real robot can integrate its gyro
+# over an 18 s episode). Change observability at the CURRENT weight first, so
+# the run reads as a clean test of the hypothesis — the way S5.4 held the head
+# weights fixed to read cleanly on steering.
 HEADING_HOLD_STD = 0.4          # rad; ~23 deg of drift costs 1/e
 # Always-on and satisfiable while hopping OR standing, so it is a common offset
 # between those two rather than a thumb on the scale for either — the only
