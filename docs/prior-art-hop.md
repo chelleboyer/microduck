@@ -1,5 +1,14 @@
 # Prior art — someone already trained a Microduck hop
 
+> **⚠ RECALIBRATED 2026-09-06.** After watching this policy's own videos next to our S5.x runs, the
+> user's judgement was that it is *"not even as good as some of my prior attempts."* Two consequences:
+> it is still valid evidence that **a hop is reachable** under BAM + backlash + DR, which is what
+> closed S1 and is why we did not spend a GPU run re-asking that — but it is **not a quality bar**, and
+> nothing in our reward design should be tuned to match it. Its `bilateral_foot_clearance` target
+> (0.035 m) was already borrowed and remains fine as a clearance scale, not as an aspiration.
+> Media for comparison: `logs/community/happy-hop-sim.mp4` and `happy-hop-REAL-ROBOT.mp4`.
+> Note it is also **ONNX-only** — no `.pt`, so it cannot be used as a training warm start.
+
 > Found 2026-09-04 while surveying community policies. This materially changes the **S1** spike in
 > [`../microduck-hopscotch-architecture.md`](../microduck-hopscotch-architecture.md). Read before
 > spending GPU on S1.

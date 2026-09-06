@@ -18,7 +18,90 @@ them is a one-way door. What the scope change actually unlocks is that two hardw
 now ours to flip if we want them: mjlab's native `height_scan`, and promoting `base_lin_vel` from
 critic-only to the actor. Neither is flipped yet — see S6 in the architecture doc.
 
-## Session 5 — START HERE (state as of 2026-09-06)
+## Session 6 — START HERE (state as of 2026-09-06, end of session 5)
+
+**S5.4 ran and the duck HOPS.** User's verdict on the video: *"that's a hop! not perfect but a hop
+nonetheless."* First time in the project that the behaviour has been called a hop rather than a bounce,
+a buzz or a scoot.
+
+| | Run | wandb | Hub |
+|---|---|---|---|
+| S5.4 | 4096 × 1500, fresh, commit `4f1e836` | `bb8t7j2e` | `chelleboyer/s54-heading-cadence-v2` |
+
+### What S5.4 fixed, measured
+
+**The head, and it was a STEERING artifact — the hypothesis is confirmed.** Head weights were
+deliberately left untouched; constraining the heading fixed the head by itself:
+
+| Joint (mean signed error) | S5.3 | S5.4 |
+|---|---|---|
+| neck_pitch | −20.4° | **−2.0°** |
+| head_pitch | +28.1° | **+5.6°** |
+| head_yaw | +21.1° | **+4.4°** |
+
+The counter-fold collapsed and the yaw crank went with it; `head_pose_bias` is 3.6× less negative
+(−0.81 → −0.22) at the *same* weight of 3.0. **Three runs of escalating head penalties failed at this;
+the fourth succeeded by not touching the head at all.** Record this as the lesson: when a penalty
+DIVERGES under a fixed weight, the behaviour is buying something elsewhere — find the buyer, don't
+raise the price.
+
+The rest, all at unchanged weights unless noted:
+
+| | S5.3 | S5.4 |
+|---|---|---|
+| `hop_settle` | 0.051 | **0.278** (5.4×) — the pause finally exists |
+| `hop_landing_quality` | 0.073 | **0.253** (3.5×) — weakest term for three runs, now real |
+| `action_rate` | −1.43 | **−0.74** — half the jitter |
+| airborne fraction | 27% | **12%** |
+| best consecutive hops | 3 | **6** |
+| landing tilt / upright | 8.5° / 98% | **7.4° / 98%** |
+| episode length | 910 | 914 — the repricing did NOT break it |
+
+`hop_displacement` reads 0.901 against S5.3's 3.965, which is **expected and not a regression**: the
+weight went 10 → 25 while the cadence cut the duty cycle ~10×, so raw is 0.036 vs 0.397. Judge it
+against the cadence, not the level.
+
+### What S5.4 did NOT fix — this is the next session's work
+
+1. **Heading is still drifting: +107.5 → +62.8 deg/s.** Better by 42%, still a full circle every
+   ~5.7 s, and `heading_hold` plateaued at **0.315 of a possible 1.5** (~21%). The weight was too
+   weak. **First thing to try: `HEADING_HOLD_WEIGHT` 1.5 → ~3.5.** It is now the only one of the
+   user's four requirements still failing outright.
+2. **Cadence barely moved: 8.71 → 7.51 hops/cycle**, phase lock 0.23 → 0.34. Diagnosis: the cadence
+   factor removes the *reward* for extra hops but never *charges* for them, so bouncing is still free
+   apart from `action_rate`. That is a design gap, not a tuning one — the fix is to make an off-beat
+   takeoff cost something, or to pay the hold enough that hopping off-beat loses to standing.
+   **Caveat: training's `hop_settle` (5.4× up) disagrees with the battery's 7.5 hops/cycle. That
+   conflict is the actuator gap below, and it should be resolved before acting on point 2.**
+
+### The instrument problem, and the tool that can now fix it
+
+Three measurements of the same policy disagree, and the disagreement is systematic:
+
+| Harness | Actuators | Says |
+|---|---|---|
+| Training (mjlab/warp) | BAM + DR + noise + delay | episodes run 914/1000 steps (~18 s) |
+| `render_policy.py` (new) | BAM, no DR/noise/delay | S5.4 fell at 6.62 s of 8 s |
+| `hop_eval.py` | **position servos** | **100% of episodes fall** |
+
+The ordering is monotonic in actuator fidelity, which is the tell. **Porting `hop_eval.py`'s
+measurements onto `render_policy.py`'s BAM path is the single highest-value piece of tooling work
+left**, and it is now small: the BAM setup is proven to work on CPU here
+(`scripts/infer_policy.py:load_mujoco_with_bam`, exercised by `tests/test_infer_policy_bam.py`, and
+used by the renderer). Until that lands, treat the battery's fall rate and hop count as suspect too —
+not just its forward travel. A residual sim-to-sim gap will remain regardless (CPU MuJoCo has no DR,
+observation noise or command delay), so BAM-on-CPU is a better instrument, not a perfect one.
+
+### Deliberately abandoned (2026-09-06)
+
+- **Chasing better video of the original bunny hop** (run `s5-forward-hop`). Its 12 training clips are
+  320×240 at camera distance 3.0 because that run passed no viewer flags. It is renderable at any
+  resolution now via `render_policy.py --no-phase`, and one was produced
+  (`logs/bunnyhop/bunnyhop-hires.mp4`, in which it falls at 0.34 s under BAM), but the thread is
+  CLOSED — S5.4 supersedes it. The bunny hop remains a historical artifact, not a target.
+- The first S5.4 submission (`mcdojmw1`, repo `chelleboyer/s54-heading-cadence`) was **cancelled at
+  iteration 166** because it was launched without viewer flags and rendered unwatchable 320×240 video.
+  Ignore that repo; `-v2` is the real run.
 
 ### The requirement, in the user's words
 
@@ -117,7 +200,7 @@ A fourth, lower-confidence observation: **apex and displacement appear to compet
 909 and decayed 25% while displacement kept climbing. If they are genuinely trading, one of them needs a
 floor rather than a weight.
 
-### S5.4 — BUILT 2026-09-06, not yet run
+### S5.4 — what was built (results above)
 
 All three diagnoses above are now implemented in `Mjlab-HopForward-Flat-MicroDuck`, locked by
 `tests/test_hop_cadence.py` (368 CPU tests green, ~18 s):
@@ -150,18 +233,12 @@ the mean, and `head_yaw` sits at **+21.1°** — cranked to one side, *in the sa
 away takes the crank with it. If `head_yaw` error collapses next run, the head problem was a heading
 problem. If it does not, the head needs its own instrument — and a fourth weight increase still isn't it.
 
-### What to watch on the next run
+These predictions were made before the run and are recorded because they held, which is weak evidence
+the model of this env is getting better: displacement dropped sharply then recovered; `hop_settle`
+became non-zero for the first time; episode length did not collapse under the repricing. The one that
+FAILED: `heading_hold` was predicted to climb toward ~1.5 and plateaued at 0.315.
 
-- **`Episode_Reward/hop_displacement` will DROP sharply at first, and that is the mechanism working**,
-  not a failure: it is paid on ~1 hop per cycle instead of ~8.7. Judge it by whether it *recovers* as
-  hops get bigger, not by its level against S5.3.
-- **`Episode_Reward/heading_hold` should climb toward ~1.5** (its weight); it is earnable from step 0 by
-  standing still, so a value stuck near 0.7 means the policy is still circling.
-- **`hop_settle` should finally become non-zero.** It has read ~0 for three runs because a scooting duck
-  never holds still; if it stays at 0 while heading_hold rises, the pause is a separate problem.
-- Every penalty ≤ 0, and episode length not collapsing (the repricing is the risk here).
-
-### What is owed before the next run
+### The standard run commands
 
 - **The 64-env / 5-iteration smoke test**, always. This machine has no CUDA, so nothing is ever proven
   to build or step locally.
@@ -176,8 +253,16 @@ PYTHONIOENCODING=utf-8 uv run train Mjlab-HopForward-Flat-MicroDuck \
 
 # THEN the real run. NOTE `--video True`, not a bare `--video`: mjlab parses
 # train args with tyro, which wants an explicit value and exits 2 without one.
+#
+# THE VIEWER FLAGS ARE NOT OPTIONAL. mjlab's defaults are 320x240 at camera
+# distance 3.0, which renders a 25 cm robot as a handful of pixels in the middle
+# of an empty floor — unwatchable, and video is this project's primary judgment
+# instrument. 640x480 at distance 0.9 with elevation -12 is the framing every
+# usable clip so far was shot with. Omitting them cost a restart on 2026-09-06.
 PYTHONIOENCODING=utf-8 uv run train Mjlab-HopForward-Flat-MicroDuck \
-    --env.scene.num-envs 4096 --agent.max_iterations 1500 --hf-jobs --video True
+    --env.scene.num-envs 4096 --agent.max_iterations 1500 --hf-jobs --video True \
+    --env.viewer.distance 0.9 --env.viewer.elevation -12 \
+    --env.viewer.width 640 --env.viewer.height 480
 ```
 
 ## The eval battery — what to trust, and what it cannot tell you
@@ -215,6 +300,13 @@ Closing that gap — or accepting it permanently — is still an open task.
 - `scripts/hopscotch/hop_eval.py` — headless eval battery; per-hop displacement, flight duration, apex
   rise, landing tilt, upright rate, consecutive streaks, plus (2026-09-06) hops per cycle, takeoff
   phase lock, heading drift, air-vs-ground travel share and whole-run head error.
+- **`scripts/hopscotch/render_policy.py` (NEW, 2026-09-06)** — renders any exported ONNX to mp4
+  locally on CPU: any resolution, tracking camera, **BAM actuators by default** (`--no-bam` for
+  hop_eval's position-servo dynamics), `--no-phase` for pre-S5.3 policies, `--fps` below 50 for slow
+  motion. This is the answer to "I can't see the policy without a GPU" and to "the training clips are
+  320×240 because of flags passed hours ago". Validated on `pollen-robotics/microduck-policies`'
+  official walker, which stays upright a full 8 s under it. Raises the scene's offscreen framebuffer
+  on the loaded model, which is what allows resolutions the training clips could never reach.
 - `scripts/hopscotch/training_montage.py` — stitches a run's clips into one labelled progression video.
 - `scripts/hopscotch/flight_probe.py --view` — watch the best open-loop hop in slow motion.
 - `scripts/export.py` works on CPU, and the **in-job auto-export works**, so a finished run leaves
@@ -261,11 +353,20 @@ not `main` — see [`upstream-pin.md`](./upstream-pin.md)).
   [`hopscotch-routine.md`](./hopscotch-routine.md).
 - [`plans/s5-forward-hop-and-landing-quality.md`](./plans/s5-forward-hop-and-landing-quality.md) is the
   S5.1 plan and is now a **historical artifact**; S5.2 and S5.3 were never planned in writing.
-- `scripts/infer_policy.py` cannot run on Windows (`termios`/`tty`), never overrides the MJCF's
-  placeholder `kp≈0.5` gains, and — unverified — **almost certainly has the same phase-carrier gap
-  `hop_eval.py` just had**, since it drives the twist slots as a velocity command from the keyboard.
-- The eval battery's 100%-fallen rate contradicts training's 910–960-step episodes. Actuator gap is the
-  likely cause, but it is unproven.
+- ~~`scripts/infer_policy.py` cannot run on Windows.~~ **FALSE, corrected 2026-09-06.** It guards the
+  import (`try: import termios, tty / except: ... = None`), so it runs here — only keyboard control is
+  disabled. `--help` works, and its `load_bam_model` / `load_mujoco_with_bam` are what
+  `render_policy.py` now builds on. Two things about it remain true: it never overrides the MJCF's
+  placeholder `kp≈0.5` gains on the legacy path, and it drives the twist slots as a **velocity
+  command**, so it has the same phase-carrier gap `hop_eval.py` had — do not use it to drive an S5.3+
+  policy. Its `--record` writes a **pickle of observations**, not video.
+- **Prior art recalibrated (user's visual judgement, 2026-09-06):**
+  `joanfox/microduck-happy-hop` is *"not even as good as some of my prior attempts"*. It is still
+  evidence that a hop is reachable under BAM + backlash, which is what closed S1, but it should no
+  longer be treated as a quality bar. See [`prior-art-hop.md`](./prior-art-hop.md).
+- **A useful external benchmark for pacing:** upstream PR #28 reached a working hop in **600
+  iterations**, `joanfox` in **1255**. Both were vertical hops from a standing entry. Nobody in the
+  public record has done forward-plus-cadence, so there is no reference for what we are doing now.
 
 ## Where the project is going
 

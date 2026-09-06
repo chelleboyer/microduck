@@ -415,6 +415,19 @@ policy stop moving entirely.
 
 ## Revision history
 
+- **2026-09-06, session 5 (end)** — **S5.4 ran, and the behaviour is a hop.** User's verdict on the
+  video: *"that's a hop! not perfect but a hop nonetheless"* — the first time this project's output has
+  been called a hop rather than a bounce, buzz or scoot. **The head result is the transferable
+  finding**: head droop had resisted three escalating instruments and was diverging under a fixed
+  weight; constraining the HEADING fixed it with no head change at all (head_yaw error +21.1° → +4.4°),
+  because the head was being used to steer. Recorded as a rule — *when a penalty diverges under a fixed
+  weight, the behaviour is buying something elsewhere; find the buyer, don't raise the price.*
+  `hop_settle` 5.4×, `hop_landing_quality` 3.5×, jitter halved, airborne 27% → 12%. Still failing:
+  heading drift only 107 → 63 deg/s with `heading_hold` plateaued at 21% of its maximum, and cadence
+  barely moved (8.7 → 7.5 hops/cycle) because the cadence factor removes the reward for extra hops
+  without charging for them. Also established: three harnesses disagree about this policy in monotonic
+  order of actuator fidelity, so closing the eval battery's actuator gap (now possible locally via
+  `render_policy.py`'s BAM path) is the gating tooling task.
 - **2026-09-06, session 5 (later)** — **S5.4 built**: `heading_hold` restores the heading constraint;
   `_hop_cadence_factor` makes the phase clock binding for the paying terms (one hop per cycle in full,
   extras at `repeat_pay`, gentle taper to a launch window); displacement and apex repriced 10 → 25 and
