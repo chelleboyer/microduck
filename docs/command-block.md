@@ -19,6 +19,24 @@ Two non-obvious behaviours:
 - **Turn-in-place is its own bucket**, `TURN_IN_PLACE_FRACTION = 0.15`, because under uniform sampling
   it emerged as ~2% of experience and never trained.
 
+**⚠ These three slots do not always carry a velocity.** Several envs replace the twist command with a
+cyclic **phase carrier**, `[cos(2πφ), sin(2πφ), 0]` (`GroundPickPhaseCommand`): ground_pick,
+sit_stand, roller_crouch, spin, and — since S5.3 — the forward hop, at a 1.6 s period. The 61D width is
+unchanged, so ONNX export and the runtime need no changes; only the **meaning** of indices 0–2 differs
+per policy.
+
+Two consequences, both learned the expensive way:
+
+- **Any off-policy driver must write what the policy was trained to read.** Zeros are the idle velocity
+  command, but in a phase carrier `(cos, sin) = (0, 0)` is not on the unit circle at all — a state that
+  occurs nowhere in training. `hop_eval.py` did exactly this and returned a confident BAD-POLICY
+  verdict rather than an error (fixed 2026-09-06; `scripts/infer_policy.py` is unverified and likely
+  still affected).
+- **Deleting the velocity-tracking rewards is mandatory when you install a phase carrier** — they would
+  pay the policy for matching `cos(2πt)` as a target speed. But note what else goes with them:
+  `track_angular_velocity` is the only term constraining heading, and the forward hop lost its heading
+  hold this way without noticing.
+
 ## `head_pose` (4) — indices 3–6
 
 Deltas from HOME in joint order `neck_pitch, head_pitch, head_yaw, head_roll`. Primary reward in the

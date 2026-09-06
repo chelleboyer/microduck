@@ -238,29 +238,35 @@ policy stop moving entirely.
 Built since session 1, no longer missing: the simultaneous-flight reward, the bilateral-clearance ramp,
 the hop environment and its `-Backlash-` twin, and the command-block semantics.
 
+Built since session 3 and no longer missing: the E1 forward-progress reward, landing-quality criteria
+(`hop_landing_quality` + `hop_landing_impact_penalty`), the flight→displacement handover curriculum, the
+headless evaluation battery, and training video that survives the job (osmesa, plus the uploader glob).
+
 Still missing, in dependency order:
 
-- **A forward-progress-while-airborne reward** (E1) — the spike's one new term.
-- **Landing-quality criteria** — *the required new work, and currently a hole.* Every gate in the hop env
-  measures the robot **during** flight (tilt, trunk height). "Lands upright" is unmeasured, so a forward
-  hop that reliably face-plants scores well today. CLAUDE.md is explicit that upright checks must measure
-  tilt, not just height.
-- **A curriculum** from hop-in-place → forward hop → consecutive hops, with stage boundaries phase-aligned
-  to what the policy has actually learned.
-- **A headless evaluation battery** — per-spawn-type outcomes, end-state clusters, air-time and
-  displacement profiles — to judge runs from evidence before changing rewards.
-- **The visual half of that battery — training video that survives the job.** CLAUDE.md is explicit that
-  *"sim metrics can pass while the video fails the human eye"*, so numbers alone cannot judge a run. The
-  dev machine reports `cuda available: False`, so nothing renders locally and `uv run play` cannot run
-  here at all — remote video is the only way to see a policy move. mjlab already records it
-  (`--video`, `--video-length`, `--video-interval`), but `scripts/hf/uploader.py` ships only
-  `model_*.pt` and `params/*`, so today those clips die with the container. A one-line glob closes it.
+- **A heading constraint.** Nothing prices yaw since S5.3 deleted `track_angular_velocity`. This is the
+  single largest gap between what the policy does and what was asked for.
+- **A binding cadence.** The phase clock exists and is ignored, because no hop payment is gated on it.
+- **An instrument for head posture across the cycle**, as opposed to another weight increase on a term
+  that is already diverging.
+- **A trustworthy off-policy measurement of forward travel** — i.e. closing the eval battery's actuator
+  gap (position servos vs BAM), or accepting permanently that only wandb and the video can answer "did
+  it travel".
 - *(deferred, approach-dependent)* Course terrain geometry; course-relative observations; the choreography
   itself; painted markers.
 
 ## Spikes & experiments
 
-**S5 — Can Microduck hop forward and land upright?** *(open, blocking, do next)*
+**S5 — Can Microduck hop forward and land upright?** *(four runs in; PARTLY ANSWERED, still open)*
+
+**Status as of 2026-09-06.** Yes to flight, yes to landing upright (98% of landings, median 8.5° tilt,
+episodes running 910–960 steps under BAM). **Not yet** to "forward" in the sense the brief means it: the
+policy scoots and circles more than it travels through the air. The spike stays open, but its question
+has narrowed from *"can it?"* to *"can the reward stack ask for it precisely enough?"* — which is a
+tuning problem, not a physics one, and that itself is a result worth recording. The decision rule below
+cannot be evaluated yet, because the only instrument that measures per-hop displacement off-policy (the
+eval battery) is not trustworthy on forward travel — see the actuator gap in `docs/hopscotch-rules.md`.
+
 The brief's Success #1, and the one question every approach depends on. Prior art does **not** answer it:
 its own model card reports a vertical hop from a standing entry and states it was *"not trained to take off
 directly from an active walking stride."*
@@ -358,21 +364,79 @@ submit only real training.
   Pollen Robotics. Not decided; costs discipline, reversible either way. Note the sim-only scope makes our
   work less directly useful to them, since their interest is hardware.
 
-**S5.1 is built (2026-09-05, session 4).** `hop_displacement` (takeoff→touchdown distance along the
-takeoff heading, paid across the landing window, capped at 10 cm) is now the forward env's main term,
-handed the lead from `simultaneous_flight` by a curriculum at iter 300 rather than swapped in — a term
-that only pays at a landing from a genuine flight is silent until flight exists, so leading with it
-would violate the phase-alignment rule. `forward_flight_progress` keeps its E1 role as the dense
-in-flight ramp at a raised (0.8 m/s) cap and a demoted weight. Head posture is priced at touchdown
-only. The forward variant evolved in place; the hop-in-place baseline remains the untouched A/B
-reference. **Not yet smoke-tested** — the dev machine has no CUDA, so the env has never been stepped
-with these terms.
+**S5.1–S5.3 are built and trained (session 4, 2026-09-05/06).** `hop_displacement` (takeoff→touchdown
+distance along the takeoff heading, paid across the landing window, capped at 10 cm) is the forward
+env's main term, handed the lead from `simultaneous_flight` by a curriculum at iter 300 rather than
+swapped in. `forward_flight_progress` keeps its E1 role as the dense in-flight ramp at a raised
+(0.8 m/s) cap and a demoted weight. S5.2 brought the head to the walker's full bias strength; S5.3 added
+the 1.6 s phase cycle, `hop_crouch_by_phase` and `hop_apex_rise`. The forward variant evolved in place;
+the hop-in-place baseline remains the untouched A/B reference. Results, and what they changed, below.
+
+## The behaviour requirement, stated by the user from video (2026-09-06)
+
+> *"He needs to hop straight ahead, pause and then repeat, all with his head up."*
+
+This is the acceptance criterion for the forward hop, and it is more specific than Success #1 in the
+brief ("hops forward and lands upright"). It decomposes into four properties, which is useful because
+each one is a separate reward question, and after four runs only the first is partly satisfied:
+
+1. **Hop** — leaves the ground. Partly: flight exists but is shallow, and two thirds of the travel
+   happens with a foot on the floor.
+2. **Straight ahead** — heading held. **No**: +107 deg/s of drift, a full circle every ~3.4 s.
+3. **Pause, then repeat** — a cadence, not a buzz. **No**: 8.7 hops per 1.6 s cycle.
+4. **Head up** — throughout, not just at touchdown. **No**: the bias penalty is diverging.
+
+**Decision: heading and cadence become first-class reward objectives, not emergent hopes.** Three runs
+assumed each would fall out of a travel reward, and none did. The evidence:
+
+**Nothing has priced yaw since S5.3.** Replacing the twist command with a phase carrier required
+deleting the terms that read it as a velocity — `track_linear_velocity`, `track_angular_velocity`,
+`air_time` (`microduck_hop_env_cfg.py:534`). That deletion was correct and its consequence was not
+thought through: `track_angular_velocity` was the only thing constraining heading. Worse,
+`hop_displacement` measures travel along the **takeoff heading**, which correctly stops a turn-and-drift
+scoring *within* a hop but makes turning *between* hops free — a hop in a new direction is paid in full.
+Turning is now a strictly cheaper way to keep earning than hopping straight. Candidate fixes:
+`heading_hold_reward` (`mdp.py:4874`, already used by the roller and swizzle envs), a yaw-rate penalty,
+or measuring displacement along a fixed episode heading.
+
+**A phase clock is advisory unless the payments are gated on it.** `hop_crouch_by_phase` pays for being
+low inside phase 0.10–0.30 and it worked (~80% of the achievable window). But `hop_displacement`,
+`hop_apex_rise` and `simultaneous_flight` pay at *any* phase, so the policy banks the crouch money and
+then hops 8–9 times per cycle. Upstream PR #28 binds it with a **launch window** (phase 0.28–0.38 paying
+vertical velocity) — the piece we adopted the crouch from and left behind.
+
+**Head droop has now resisted three different instruments** (a touchdown-only factor, the walker's full
+DC bias curriculum, and both together) and is *diverging* under a fixed weight of 3.0. That pattern says
+something is paying more for the droop than the penalty costs — most plausibly `hop_apex_rise` and
+`hop_displacement` using the 280 g head as a countermovement, which deviation 3 deliberately allowed.
+**A fourth weight increase is not the next move**; measuring what the head does across the cycle is.
+`microduck_velocity_env_cfg.py:729-737` still stands: tightening `head_pose_tracking`'s std made the
+policy stop moving entirely.
 
 ## Revision history
 
-- **2026-09-05, session 4** — **S5.1 implemented**: per-hop displacement replaces air time as the
-  forward env's objective, via a phase-aligned handover curriculum; forward cap raised off saturation;
-  head priced at touchdown. 278 CPU tests green. The GPU smoke test is owed before the next run.
+- **2026-09-06, session 5 (later)** — **S5.4 built**: `heading_hold` restores the heading constraint;
+  `_hop_cadence_factor` makes the phase clock binding for the paying terms (one hop per cycle in full,
+  extras at `repeat_pay`, gentle taper to a launch window); displacement and apex repriced 10 → 25 and
+  6 → 15 to cover the ~10x duty-cycle cut, because rate-limiting without repricing is an attempt tax.
+  Head weights deliberately unchanged, so the run reads cleanly on whether the head-yaw crank is a
+  steering artifact. A latent ordering bug fixed on the way: scaling parameters passed into the
+  step-guarded latch took effect only for whichever term the reward manager evaluated first.
+- **2026-09-06, session 5** — **S5.3 ran to completion** (2500 iters, wandb `tbs1k86h`,
+  `chelleboyer/s53-phase-hop`). The crouch works; the rhythm and the heading do not. The user's video
+  verdict — *"more scooting himself around in a circle"* — was confirmed numerically once the eval
+  battery was fixed: 8.7 hops per 1.6 s cycle, takeoff phase lock 0.23, 34% of travel in the air,
+  +107 deg/s heading drift. **Recorded as decisions:** heading and cadence become first-class reward
+  objectives rather than emergent hopes, and the head gets measured before it gets another weight
+  increase. Also recorded: replacing a velocity command with a phase carrier silently removed the only
+  heading constraint in the env, and a phase clock is advisory until the payments are gated on it.
+- **2026-09-05/06, session 4** — **S5.1, S5.2 and S5.3 implemented and trained.** S5.1: per-hop
+  displacement replaces air time as the forward env's objective, via a phase-aligned handover
+  curriculum; forward cap raised off saturation; head priced at touchdown. S5.2: head to the walker's
+  full DC-bias strength, plus a pause-scaled hop — the head half helped, the rhythm half failed
+  measurably (a 0.5 s pause demanded from step 0 silenced the displacement term, which collapsed 7×).
+  S5.3: the 1.6 s phase cycle, `hop_crouch_by_phase` and `hop_apex_rise`, after finding that nothing in
+  the stack had ever paid for the trunk going UP. Upstream re-pulled, pin `1e79c29` → `29e887e`.
 - **2026-09-04, session 1** — original decisions. Approach A chosen; B rejected as undeployable; C
   rejected as brittle. S1 blocking.
 - **2026-09-04, session 2** — S2 and S3 resolved. Command-block semantics resolved. Hop env and both

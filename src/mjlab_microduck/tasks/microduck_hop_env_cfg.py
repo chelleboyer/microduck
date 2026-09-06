@@ -146,6 +146,54 @@ growing flag matrix.
    dense in-flight ramp (the role bilateral_foot_clearance plays under flight)
    and loses its claim to being a driver.
 
+S5.4 — STRAIGHT AHEAD, ONE HOP PER BEAT (forward=True, 2026-09-06)
+------------------------------------------------------------------
+S5.3 ran 2500 iters and the crouch worked (~80% of its achievable window). The
+rhythm and the heading did not. The user's verdict on the video was "he's kind
+of hopping, but more scooting himself around in a circle", and the requirement
+is "hop straight ahead, pause and then repeat, all with his head up". The eval
+battery — fixed the same day to drive the phase clock instead of writing zeros
+into a phase carrier — measured all three failures.
+
+14. **heading_hold (1.5).** S5.3 installed the phase carrier and correctly
+   deleted the three terms that read the twist slot as a velocity. One of them,
+   track_angular_velocity, was the ONLY constraint on heading in this env, and
+   nothing replaced it: measured drift +107 deg/s, a full circle every 3.4 s.
+   Compounding it, hop_displacement measures along the TAKEOFF heading, so a
+   turn BETWEEN hops costs nothing and the next hop is paid in full — turning
+   was strictly cheaper than hopping straight. The existing heading_hold_reward
+   prices the yaw ANGLE against the spawn heading, which lets the policy steer
+   back; its docstring records why a yaw-RATE penalty is the wrong tool.
+
+15. **The phase clock becomes binding for the terms that PAY.** hop_crouch was
+   gated on phase; hop_displacement, hop_apex_rise and simultaneous_flight were
+   not, so the policy took the crouch money and hopped 8.7 times per cycle
+   (takeoff phase lock 0.23). Now the first genuine hop of each cycle is paid in
+   full and the rest earn HOP_REPEAT_PAY, with a gentle taper toward the launch
+   window (0.28-0.38, immediately after the crouch window, following PR #28).
+   Note the shape: this does NOT scale down the hop that counts — that is
+   exactly how S5.2's pause requirement silenced the term and collapsed
+   displacement 7x. It removes the reward for the EXTRA hops and leaves the
+   first one whole, so the term cannot go quiet.
+
+15b. **Note the resulting order of discovery, which is deliberate.** From step 0
+   the stack pays flight (5.0) and apex (15.0) but not displacement (0 until
+   iter 300) — so the first thing the policy is asked to find is ONE good
+   vertical hop per cycle, and travel is added to a hop that already exists.
+   Both terms are silent until a genuine flight happens, so neither leads a
+   skill that is not there yet.
+
+16. **The head is measured, not re-weighted.** head_pose_bias has now resisted
+   three instruments and is DIVERGING under a fixed weight of 3.0 (-0.43 at
+   iter 909, -0.85 at 2471), so a fourth increase is not the move. The eval
+   battery's per-joint breakdown says why the aggregate looked survivable:
+   neck_pitch -20.4 deg and head_pitch +28.1 deg are a COUNTER-FOLD that nearly
+   cancels in the mean, and head_yaw sits +21.1 deg — cranked to one side, in
+   the same direction as the +97 deg/s body drift. That co-occurrence is the
+   hypothesis this run tests: the head is being used to steer, and taking the
+   circle away should take the crank with it. Head weights are UNCHANGED here
+   on purpose, so the next run is a clean read on that.
+
 COMMAND ENCODING
 ----------------
 Hop intent lives in **body_pose[2]** (the z component), per docs/command-block.md.
@@ -245,8 +293,9 @@ HOP_TRACK_LIN_VEL_WEIGHT = 0.3
 HOP_DISP_CAP = 0.10
 # Final weight of the main term. Sized by reward MASS against what a hop used to
 # earn from air time — see docstring note 11 — not by comparison with the face
-# value of the per-step terms around it.
-HOP_DISP_WEIGHT = 10.0
+# value of the per-step terms around it. RAISED 10.0 -> 25.0 in S5.4, when the
+# cadence factor cut the term's duty cycle ~10x; see the repricing note there.
+HOP_DISP_WEIGHT = 25.0
 # Iteration at which displacement takes over from flight. Phase alignment, not a
 # schedule: flight leads while the skill is being discovered, displacement leads
 # once it exists. Keyed to ACTION_RATE_KICKIN_ITER (400), which S5 established as
@@ -329,7 +378,10 @@ HOP_CROUCH_Z = 0.106      # PR #28's measured crouch target, m
 HOP_CROUCH_WEIGHT = 3.0
 # Under PR #28's measured 67 mm so the target is demanding, not impossible.
 HOP_APEX_TARGET = 0.05
-HOP_APEX_WEIGHT = 6.0
+# RAISED 6.0 -> 15.0 in S5.4 alongside HOP_DISP_WEIGHT, for the same reason: the
+# cadence factor pays one hop per cycle instead of 8.7, so the weight carries
+# what the duty cycle no longer does.
+HOP_APEX_WEIGHT = 15.0
 # The phase clock now provides the pause, so the displacement term stops
 # policing it. S5.2 proved a 0.5 s requirement imposed from step 0 just silences
 # the term; a short backstop is enough to keep a bounce from banking travel.
@@ -338,6 +390,67 @@ HOP_MIN_GROUND_S_S53 = 0.15
 # paying per airborne step on top is double-paying, and it is the measured
 # bounce engine (53% of life in the air at weight 2.0).
 FLIGHT_WEIGHT_S53 = 0.25
+
+# ── S5.4: straight ahead, and one hop per beat (user call, 2026-09-06) ────────
+# The S5.3 run's video: "he's kind of hopping, but more scooting himself around
+# in a circle", and the requirement: "he needs to hop straight ahead, pause and
+# then repeat, all with his head up". The fixed eval battery put numbers on it:
+#   8.71 hops per 1.6 s cycle, takeoff phase lock 0.23  -> no cadence
+#   +107 deg/s heading drift                            -> the circle
+#   34% of travel in the air                            -> the scoot
+#
+# HEADING. Installing the phase carrier in S5.3 required deleting the terms that
+# read the twist slot as a velocity — and track_angular_velocity was the ONLY
+# thing constraining heading. Nothing replaced it, so turning became free.
+# hop_displacement measures travel along the TAKEOFF heading, which correctly
+# stops a turn-and-drift scoring within a hop, but also means a hop in any new
+# direction is paid in full: turning is a cheaper way to keep earning than
+# hopping straight.
+#
+# heading_hold_reward (mdp.py) is the right instrument and already exists — it
+# prices the yaw ANGLE against the spawn heading, so a drift lowers the reward
+# and the policy can steer BACK to recover it. Its docstring is explicit that a
+# yaw-RATE penalty is the wrong tool: it says "never turn", which cannot correct
+# a drift once it has happened.
+HEADING_HOLD_STD = 0.4          # rad; ~23 deg of drift costs 1/e
+# Always-on and satisfiable while hopping OR standing, so it is a common offset
+# between those two rather than a thumb on the scale for either — the only
+# behaviour it demotes is the circle. Sized against `upright` (1.51/step in the
+# S5.3 run), the other always-on posture term.
+HEADING_HOLD_WEIGHT = 1.5
+
+# CADENCE. The phase clock existed in S5.3 and was ignored, because hop_crouch
+# was the only term gated on it while every PAYMENT was phase-blind. Two knobs,
+# both in _hop_cadence_factor:
+#   - repeat_pay: what the 2nd..Nth hop of a cycle earns. 0.0 = only the first
+#     hop of each cycle is paid. Note this does NOT scale down the hop that
+#     counts, which is exactly how S5.2's pause requirement silenced the term;
+#     it removes the reward for the extras and leaves the first hop whole.
+HOP_REPEAT_PAY = 0.0
+#   - the launch window: PR #28's, immediately after our crouch window (0.10-
+#     0.30), so crouch and launch read as one countermovement.
+HOP_LAUNCH_PHASE = (0.28, 0.38)
+# Gentle on purpose. floor 0.5 means an off-beat hop is still worth half, so
+# this shapes the rhythm instead of forbidding everything else — the taper is
+# ~0.15 of a cycle (240 ms at 1.6 s), which is the scale of a hop.
+HOP_LAUNCH_TAPER = 0.15
+HOP_LAUNCH_FLOOR = 0.5
+
+# REPRICING, and the part most likely to need adjusting. Rate-limiting the
+# payment without repricing the hop is an attempt tax, and CLAUDE.md is explicit
+# about where those lead: "do nothing" wins. The measured duty cycle says how
+# much: S5.3 collected on 8.71 hops per cycle, so their landing windows covered
+# the cycle almost continuously (hop_displacement 4.04/step weighted). Paying
+# ONE hop across one 0.15 s window in a 1.6 s cycle is a ~9% duty — a ~10x drop
+# in this term's reward mass if the weights stand still, against penalties that
+# do not shrink (action_rate alone ran -1.43).
+#
+# HOP_DISP_WEIGHT (10.0 -> 25.0) and HOP_APEX_WEIGHT (6.0 -> 15.0) below carry
+# the repricing. They restore roughly a third of the lost mass: enough that one
+# good hop per cycle is clearly worth more than standing still and collecting
+# heading_hold + upright, and not so much that displacement drowns the stack it
+# shares. If the next run stops hopping, those two are the dials — not the
+# cadence.
 
 
 def make_microduck_hop_env_cfg(
@@ -562,6 +675,26 @@ def make_microduck_hop_env_cfg(
         # The phase clock now owns the rhythm; the pause factor steps back to a
         # backstop so it cannot silence the travel term the way S5.2's did.
         cfg.rewards["hop_displacement"].params["min_ground_s"] = HOP_MIN_GROUND_S_S53
+
+        # ── S5.4: hop STRAIGHT AHEAD, one hop per beat ───────────────────────
+        # Restores a heading constraint to an env that has had none since the
+        # phase carrier displaced track_angular_velocity above.
+        cfg.rewards["heading_hold"] = RewardTermCfg(
+            func=microduck_mdp.heading_hold_reward,
+            weight=HEADING_HOLD_WEIGHT,
+            params={"std": HEADING_HOLD_STD},
+        )
+
+        # Make the clock BINDING for the terms that pay. Both terms get the
+        # identical factor — a hop is one event, and paying its distance and its
+        # height on different cadences would let the policy split them.
+        for _name in ("hop_displacement", "hop_apex_rise"):
+            cfg.rewards[_name].params.update(
+                launch_phase=HOP_LAUNCH_PHASE,
+                launch_taper=HOP_LAUNCH_TAPER,
+                launch_floor=HOP_LAUNCH_FLOOR,
+                repeat_pay=HOP_REPEAT_PAY,
+            )
 
     # ── Curricula ─────────────────────────────────────────────────────────────
     # The velocity env ramps head_pose_bias from iter 600. Drop it: it is a

@@ -7654,6 +7654,9 @@ def _heading_xy(quat: torch.Tensor) -> torch.Tensor:
 # Sentinel for "this env is not inside a landing window" — larger than any
 # window a caller would set, so the payment condition is a plain comparison.
 _HOP_NO_LANDING = 1.0e6
+# Which command slot the hop cycle rides in. The twist slot, as with ground_pick,
+# sit_stand, roller_crouch and spin — see docs/command-block.md.
+_HOP_PHASE_COMMAND = "twist"
 
 
 def _hop_displacement_state(env: ManagerBasedRlEnv) -> None:
@@ -7681,7 +7684,46 @@ def _hop_displacement_state(env: ManagerBasedRlEnv) -> None:
         env._hop_takeoff_z = torch.zeros(n, device=env.device)
         env._hop_apex_z = torch.zeros(n, device=env.device)
         env._hop_last_rise = torch.zeros(n, device=env.device)
+        # Cadence bookkeeping (S5.4). The phase clock was installed in S5.3 and
+        # then ignored — 8.7 hops per 1.6 s cycle, takeoff phase lock 0.23 —
+        # because the crouch was the only term gated on it while every PAYMENT
+        # was phase-blind. These three make the cycle countable:
+        #   _hop_phase_prev    previous step's phase, to spot the wrap
+        #   _hop_cycle_hops    genuine hops already banked in the current cycle
+        #   _hop_takeoff_phase phase at the current (or pending) takeoff
+        # -1 means "no phase carrier in this env", which is the hop-in-place
+        # baseline and every pre-S5.3 policy — there the cadence factor is 1.0
+        # and nothing below changes behaviour.
+        env._hop_phase_prev = torch.full((n,), -1.0, device=env.device)
+        env._hop_cycle_hops = torch.zeros(n, device=env.device)
+        env._hop_takeoff_phase = torch.full((n,), -1.0, device=env.device)
+        # Banked AT THE LANDING EDGE, describing the hop just latched: the pause
+        # that preceded it, the phase it left the ground at, and how many hops
+        # already happened in that cycle (0 = the first).
+        env._hop_banked_pause = torch.zeros(n, device=env.device)
+        env._hop_banked_phase = torch.full((n,), -1.0, device=env.device)
+        env._hop_banked_index = torch.zeros(n, device=env.device)
         env._hop_disp_last_step = -1
+
+
+def _hop_phase_or_none(env: ManagerBasedRlEnv) -> "torch.Tensor | None":
+    """The hop-cycle phase in [0, 1), or None if this env has no phase carrier.
+
+    Detected by TYPE, not by a parameter. The latch is shared by every hop term
+    and is step-guarded, so whichever term happens to run first in a step is the
+    one whose arguments would have been used — a parameter here would make the
+    latch's behaviour depend on reward-dict ordering. Introspecting the command
+    term instead is order-proof and gives the right answer in both envs: the
+    forward hop carries a GroundPickPhaseCommand in the twist slot, the
+    hop-in-place baseline carries a velocity command and gets None.
+    """
+    try:
+        term = env.command_manager.get_term(_HOP_PHASE_COMMAND)
+    except (KeyError, AttributeError, ValueError):
+        return None
+    if not isinstance(term, GroundPickPhaseCommand):
+        return None
+    return _gp_phase(env, _HOP_PHASE_COMMAND)
 
 
 def _update_hop_displacement(
@@ -7689,13 +7731,21 @@ def _update_hop_displacement(
     sensor_name: str,
     min_flight_s: float,
     asset_cfg: SceneEntityCfg,
-    min_ground_s: float = 0.0,
 ) -> torch.Tensor:
     """Advance the takeoff latch one control step; return the latched hop distance.
 
     Step-guarded on ``common_step_counter`` so several terms reading the latch
     in one step (E3 will) cannot double-advance it — the same guard
     ``_update_roulade_accum`` uses.
+
+    **The latch banks RAW quantities only** (distance, rise, the pause that
+    preceded the hop, the takeoff phase, the hop's index within its cycle), and
+    every scaling — the pause ramp, the cadence factor, the caps — is applied by
+    the individual reward terms. That split is deliberate: because the update is
+    step-guarded, a scaling parameter passed *here* would silently take effect
+    only for whichever term the reward manager happens to evaluate first.
+    ``min_ground_s`` used to live in this function and worked purely by the
+    accident that ``hop_displacement`` was registered before ``hop_settle``.
 
     The latch needs no takeoff EDGE detection: while any foot is down, the
     takeoff point is simply refreshed to the current pose, so at the instant the
@@ -7739,6 +7789,20 @@ def _update_hop_displacement(
         airborne, torch.maximum(env._hop_apex_z, z), env._hop_apex_z
     )
 
+    # 0. The hop cycle. Phase runs 0 -> 1 and wraps; each wrap starts a fresh
+    # cycle with its hop budget reset. Envs with no phase carrier keep -1 and
+    # every cadence quantity below stays inert.
+    phase = _hop_phase_or_none(env)
+    if phase is None:
+        phase = torch.full_like(env._hop_phase_prev, -1.0)
+        wrapped = torch.zeros_like(env._hop_cycle_hops, dtype=torch.bool)
+    else:
+        wrapped = phase < env._hop_phase_prev
+    env._hop_phase_prev = phase
+    env._hop_cycle_hops = torch.where(
+        wrapped, torch.zeros_like(env._hop_cycle_hops), env._hop_cycle_hops
+    )
+
     # 1. Landing edge, while the latch still holds the takeoff pose.
     zeros = torch.zeros_like(env._hop_last_disp)
     flew = torch.nan_to_num(last_air, nan=0.0).min(dim=1).values
@@ -7746,19 +7810,24 @@ def _update_hop_displacement(
     landed_now = (~airborne) & env._hop_was_airborne
     genuine = landed_now & (flew >= min_flight_s)
 
-    # THE RHYTHM: a hop only counts in proportion to the pause that preceded
-    # it. ``_hop_ground_s`` froze at takeoff, so at this edge it still holds the
-    # length of that pause. Deliberately a smooth ramp, not a cliff — a hard
-    # gate would pay exactly 0 for every hop a bouncing policy can currently
-    # produce, which is how a term goes silent and stops teaching anything
-    # (the failure mode forward_flight_progress sat in through all of S5).
-    if min_ground_s > 0.0:
-        pause = (env._hop_ground_s / min_ground_s).clamp(max=1.0)
-    else:
-        pause = torch.ones_like(banked)
+    # Raw distance only — the pause ramp and the cadence factor are applied by
+    # the terms that pay, for the ordering reason in this function's docstring.
     env._hop_last_disp = torch.where(
-        landed_now, torch.where(genuine, banked * pause, zeros), env._hop_last_disp
+        landed_now, torch.where(genuine, banked, zeros), env._hop_last_disp
     )
+    # Bank the hop's context at the same edge. ``_hop_ground_s`` froze at
+    # takeoff, so it still holds the pause that preceded it — step 1c below is
+    # what resets it, and it must not run first.
+    env._hop_banked_pause = torch.where(
+        genuine, env._hop_ground_s, env._hop_banked_pause
+    )
+    env._hop_banked_phase = torch.where(
+        genuine, env._hop_takeoff_phase, env._hop_banked_phase
+    )
+    env._hop_banked_index = torch.where(
+        genuine, env._hop_cycle_hops, env._hop_banked_index
+    )
+    env._hop_cycle_hops = env._hop_cycle_hops + genuine.float()
     # Same edge, same gates: bank how high it actually got, measured against the
     # height it left from rather than absolute z, so a crouch-then-extend is
     # credited for the whole rise and standing tall earns nothing.
@@ -7803,6 +7872,10 @@ def _update_hop_displacement(
     g1 = ~airborne
     env._hop_takeoff_z = torch.where(g1, z, env._hop_takeoff_z)
     env._hop_apex_z = torch.where(g1, z, env._hop_apex_z)
+    # Same idiom for the phase: while a foot is down, the pending takeoff phase
+    # is simply now, so at the instant the last foot leaves it already holds the
+    # phase the robot launched at.
+    env._hop_takeoff_phase = torch.where(g1, phase, env._hop_takeoff_phase)
     env._hop_was_airborne = airborne
 
     # 3. Freshly reset envs bank nothing from the previous episode.
@@ -7814,7 +7887,69 @@ def _update_hop_displacement(
         fresh, torch.full_like(env._hop_since_land, _HOP_NO_LANDING), env._hop_since_land
     )
     env._hop_ground_s = torch.where(fresh, zeros, env._hop_ground_s)
+    env._hop_cycle_hops = torch.where(fresh, zeros, env._hop_cycle_hops)
+    env._hop_banked_pause = torch.where(fresh, zeros, env._hop_banked_pause)
+    env._hop_banked_index = torch.where(fresh, zeros, env._hop_banked_index)
     return env._hop_last_disp
+
+
+def _hop_cadence_factor(
+    env: ManagerBasedRlEnv,
+    launch_phase: "tuple[float, float] | None",
+    launch_taper: float,
+    launch_floor: float,
+    repeat_pay: float,
+) -> torch.Tensor:
+    """How much of a banked hop's payment the CADENCE allows. [0, 1].
+
+    Two independent questions about the hop that was just banked — how many, and
+    when — answered as one multiplier so every payment term applies it
+    identically.
+
+    **How many: one paid hop per cycle.** The S5.3 run hopped 8.7 times per
+    1.6 s cycle. Scaling every hop down would have been the wrong instrument —
+    S5.2 proved it, when a pause requirement imposed from step 0 silenced
+    ``hop_displacement`` and collapsed it 7x. This pays the FIRST genuine hop of
+    each cycle in full and the rest at ``repeat_pay``, so the term can never go
+    quiet (a hop always pays something the first time it happens in a cycle)
+    while extra hops stop being worth taking. CLAUDE.md's rule is to rate-limit
+    a repeatable payment, not to cliff it.
+
+    **When: near the launch window.** A gentle taper toward ``launch_floor``,
+    NOT a gate — it makes an on-beat hop worth more than an off-beat one and
+    leaves an off-beat hop clearly worth doing, which is the difference between
+    shaping a rhythm and forbidding everything else. The window follows the
+    crouch window so the countermovement and the launch read as one motion.
+
+    Envs with no phase carrier (the hop-in-place baseline, every pre-S5.3
+    policy) bank phase -1 and get exactly 1.0 — BOTH halves are inert there.
+    That applies to the per-cycle budget too, and not only to the alignment:
+    with no clock there are no cycle boundaries, so the budget would never
+    refill and every hop after the first in an episode would pay zero.
+    """
+    ph = env._hop_banked_phase
+    has_phase = ph >= 0.0
+
+    first = (env._hop_banked_index < 0.5).float()
+    count = torch.where(has_phase, first + (1.0 - first) * repeat_pay,
+                        torch.ones_like(first))
+
+    if launch_phase is None:
+        return count
+
+    lo, hi = launch_phase
+    # Circular distance to the window, 0 inside it. Phase wraps, so a takeoff at
+    # 0.98 is 0.10 away from a window opening at 0.08, not 0.90.
+    below = torch.remainder(lo - ph, 1.0)
+    above = torch.remainder(ph - hi, 1.0)
+    dist = torch.minimum(below, above)
+    dist = torch.where((ph >= lo) & (ph < hi), torch.zeros_like(dist), dist)
+    align = launch_floor + (1.0 - launch_floor) * torch.exp(
+        -((dist / max(launch_taper, 1e-6)) ** 2)
+    )
+    # No phase carrier -> no opinion about timing.
+    align = torch.where(ph < 0.0, torch.ones_like(align), align)
+    return count * align
 
 
 def hop_displacement(
@@ -7825,6 +7960,10 @@ def hop_displacement(
     landing_window_s: float = 0.15,
     max_tilt_deg: float = 30.0,
     min_ground_s: float = 0.0,
+    launch_phase: "tuple[float, float] | None" = None,
+    launch_taper: float = 0.15,
+    launch_floor: float = 0.5,
+    repeat_pay: float = 0.0,
     settle_steps: int = 2,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
@@ -7872,11 +8011,24 @@ def hop_displacement(
     argmax. This is hopscotch's actual rhythm — you land in a square and stand
     in it — and it is the second half of the fix for a policy that was living
     in the air. Companion term: ``hop_settle``, which pays for the hold itself.
+
+    ``launch_phase`` / ``repeat_pay`` add the CADENCE (S5.4): at most one hop
+    per phase cycle is paid in full, and hops that leave the ground near the
+    launch window are worth more than hops that ignore the clock. See
+    ``_hop_cadence_factor`` — and note it multiplies rather than gates, so this
+    term cannot be silenced by a policy that has not found the rhythm yet.
     """
-    disp = _update_hop_displacement(
-        env, sensor_name, min_flight_s, asset_cfg, min_ground_s
-    )
+    disp = _update_hop_displacement(env, sensor_name, min_flight_s, asset_cfg)
     progress = disp.clamp(min=0.0, max=disp_cap) / max(disp_cap, 1e-6)
+
+    # The pause that preceded the banked hop. Smooth ramp, never a cliff — a
+    # hard gate pays exactly 0 for every hop a bouncing policy can currently
+    # produce, which is how a term goes silent and stops teaching anything.
+    if min_ground_s > 0.0:
+        progress = progress * (env._hop_banked_pause / min_ground_s).clamp(max=1.0)
+    progress = progress * _hop_cadence_factor(
+        env, launch_phase, launch_taper, launch_floor, repeat_pay
+    )
 
     asset: Entity = env.scene[asset_cfg.name]
     quat = asset.data.root_link_quat_w
@@ -7899,6 +8051,10 @@ def hop_apex_rise(
     min_flight_s: float = 0.02,
     landing_window_s: float = 0.15,
     max_tilt_deg: float = 30.0,
+    launch_phase: "tuple[float, float] | None" = None,
+    launch_taper: float = 0.15,
+    launch_floor: float = 0.5,
+    repeat_pay: float = 0.0,
     settle_steps: int = 2,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
@@ -7926,6 +8082,11 @@ def hop_apex_rise(
     """
     _update_hop_displacement(env, sensor_name, min_flight_s, asset_cfg)
     rise = env._hop_last_rise.clamp(min=0.0, max=rise_target) / max(rise_target, 1e-6)
+    # Same cadence factor as hop_displacement, for the same reason: without it
+    # this term pays 8-9 shallow rises per cycle instead of one real one.
+    rise = rise * _hop_cadence_factor(
+        env, launch_phase, launch_taper, launch_floor, repeat_pay
+    )
 
     asset: Entity = env.scene[asset_cfg.name]
     quat = asset.data.root_link_quat_w

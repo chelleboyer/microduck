@@ -1,5 +1,12 @@
 # Feature: S5 — forward hop (E1) + landing quality
 
+> **HISTORICAL ARTIFACT (2026-09-06).** This plan was implemented, trained and superseded. It describes
+> S5 and S5.1 only; **S5.2 (head + rhythm) and S5.3 (phase cycle, crouch, apex) were never planned in
+> writing** — read them in the `microduck_hop_env_cfg.py` docstring, their commit messages, and
+> [`../hopscotch-rules.md`](../hopscotch-rules.md), which carries the live state. Kept for the
+> rationale behind the terms that still exist (`forward_flight_progress`, `hop_landing_quality`,
+> `hop_landing_impact_penalty`) and for the measured open-loop baseline. Do not execute it as written.
+
 The following plan should be complete, but its important that you validate documentation and codebase patterns and task sanity before you start implementing.
 
 Pay special attention to naming of existing utils types and models. Import from the right files etc.

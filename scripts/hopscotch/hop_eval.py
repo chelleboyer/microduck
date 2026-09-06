@@ -45,6 +45,32 @@ What this harness IS reliable for, because they do not depend on actuator
 fidelity: hop COUNT, consecutive-hop streaks, landing tilt distribution, and
 fall rate. Those are geometry and contact, not torque.
 
+THE TWIST SLOT IS A PHASE CLOCK, NOT A VELOCITY COMMAND (S5.3)
+--------------------------------------------------------------
+As of S5.3 the forward hop env replaces the twist command with a
+``GroundPickPhaseCommand``: the first three obs command slots carry
+``[cos(2*pi*phase), sin(2*pi*phase), 0]`` on a 1.6 s cycle, exactly as
+ground_pick and sit_stand already do. The 61D contract is untouched; the
+SEMANTICS of three slots changed.
+
+This harness used to write zeros there, which was correct for a velocity
+command (all-zero is the idle state) and is CATASTROPHIC for a phase carrier:
+``(cos, sin) = (0, 0)`` is not on the unit circle at all, so the policy is fed
+a state that does not exist anywhere in its training distribution. It does not
+error — it produces a confident, wrong BAD-POLICY verdict, which is the same
+failure shape as the projected-gravity default documented below.
+
+So the clock is driven here too (``--phase-period``, default 1.6 s). Pass
+``--no-phase`` for policies whose twist slot really is a velocity command: the
+hop-in-place baseline ``Mjlab-Hop-Flat-MicroDuck``, and any forward policy
+trained before S5.3 (runs s5-forward-hop, s51-forward-hop, s52-head-rhythm).
+The mode is printed in the header — check it against the policy you are
+judging, because neither mode can detect that it is the wrong one.
+
+Driving the clock also makes the RHYTHM measurable, which is the open question
+S5.2 and S5.3 were both aimed at: the report adds hops per cycle (1.0 is the
+intended cadence) and how tightly takeoff locks to a consistent phase.
+
 THE METRIC TRAPS (both cost real money in this project)
 -------------------------------------------------------
 1. **Contact-loss is not flight.** A duck falling over loses both foot contacts
@@ -58,6 +84,7 @@ Usage:
     uv run python scripts/hopscotch/hop_eval.py policy.onnx
     uv run python scripts/hopscotch/hop_eval.py policy.onnx --episodes 40 --json out.json
     uv run python scripts/hopscotch/hop_eval.py policy.onnx --hop-cmd 0.06
+    uv run python scripts/hopscotch/hop_eval.py policy.onnx --no-phase   # pre-S5.3
 """
 
 from __future__ import annotations
@@ -92,6 +119,13 @@ FLIGHT_MIN_HEIGHT = 0.10
 FLIGHT_MAX_TILT_DEG = 30.0
 FLIGHT_MIN_S = 0.02
 
+# Hop cycle length, s. MUST match HOP_PERIOD in microduck_hop_env_cfg.py — the
+# policy learned one hop per cycle at this period, and driving the clock at any
+# other rate asks it to hop to a beat it never heard. Duplicated rather than
+# imported to keep this script torch/warp-free (the infer_policy.py idiom);
+# tests/test_hop_eval_phase.py fails if the two drift apart.
+PHASE_PERIOD_S = 1.6
+
 # S5 decision rule (architecture doc). The pass mark is scaled off the measured
 # open-loop forward baseline, NOT asserted — see docs/s1-flight-probe.md.
 OPEN_LOOP_FORWARD_M = 0.008
@@ -108,6 +142,8 @@ class Hop:
     rise_m: float             # peak trunk z above its pre-takeoff height
     land_tilt_deg: float
     landed_upright: bool
+    takeoff_phase: float      # hop-cycle phase at liftoff; -1.0 when --no-phase
+    yaw_change_deg: float     # heading turned between takeoff and touchdown
 
 
 @dataclass
@@ -116,12 +152,45 @@ class Episode:
     max_consecutive: int = 0   # longest run of hops with no fall between them
     fell: bool = False
     steps: int = 0
+    # "Is it hopping or scooting?" — horizontal path length, split by whether
+    # both feet were off the floor. Measured the same way in both states, so
+    # the RATIO survives the position-servo caveat better than the absolute
+    # distances do.
+    path_m: float = 0.0
+    air_path_m: float = 0.0
+    # Net heading change over the episode. Nothing constrains yaw since S5.3
+    # deleted track_angular_velocity with the phase carrier, so a policy can
+    # bank displacement while turning — which reads on video as hopping in a
+    # circle.
+    yaw_drift_deg: float = 0.0
+    # Head posture, averaged over the whole episode rather than at touchdown:
+    # "head up ALL the time" is the stated requirement, and the run's
+    # head_pose_bias penalty says the DC droop is what is failing.
+    head_err_deg_sum: float = 0.0
+    head_pitch_deg_sum: float = 0.0
+    # Per-joint signed error, [neck_pitch, head_pitch, head_yaw, head_roll].
+    # The mean |error| alone cannot say WHICH joint is off, and "the head is
+    # down" and "the head is turned" want different fixes.
+    head_joint_deg_sum: np.ndarray = field(
+        default_factory=lambda: np.zeros(4, dtype=np.float64))
 
 
 def _tilt_deg(quat: np.ndarray) -> float:
     """Angle between the trunk's local +z and world +z, from a (w,x,y,z) quat."""
     up_z = 1.0 - 2.0 * (quat[1] ** 2 + quat[2] ** 2)
     return math.degrees(math.acos(max(-1.0, min(1.0, up_z))))
+
+
+def _yaw_deg(quat: np.ndarray) -> float:
+    """Trunk heading about world +z, from a (w,x,y,z) quat."""
+    w, x, y, z = (float(v) for v in quat[:4])
+    return math.degrees(math.atan2(2.0 * (w * z + x * y),
+                                   1.0 - 2.0 * (y * y + z * z)))
+
+
+def _wrap_deg(a: float) -> float:
+    """Signed shortest angular difference, degrees -> (-180, 180]."""
+    return (a + 180.0) % 360.0 - 180.0
 
 
 def _quat_rotate_inverse(quat: np.ndarray, vec: np.ndarray) -> np.ndarray:
@@ -133,10 +202,16 @@ def _quat_rotate_inverse(quat: np.ndarray, vec: np.ndarray) -> np.ndarray:
 class _Runner:
     """Drives one ONNX policy through CPU MuJoCo and records hop events."""
 
-    def __init__(self, model, data, session, hop_cmd: float, use_projected_gravity: bool):
+    def __init__(self, model, data, session, hop_cmd: float,
+                 use_projected_gravity: bool, phase_period: float):
         self.model, self.data, self.session = model, data, session
         self.hop_cmd = hop_cmd
         self.use_projected_gravity = use_projected_gravity
+        # 0.0 disables the clock and leaves the twist slots at zero — the idle
+        # velocity command, correct for pre-S5.3 policies only.
+        self.phase_period = phase_period
+        self.dt = model.opt.timestep * DECIMATION
+        self.phase = 0.0
         self.input_name = session.get_inputs()[0].name
         self.obs_dim = session.get_inputs()[0].shape[-1]
 
@@ -178,10 +253,18 @@ class _Runner:
     def observe(self) -> np.ndarray:
         """61D: 48 proprioception + [twist(3), head_pose(4), body_pose(6)].
 
-        Hop intent lives in body_pose[2] per docs/command-block.md; every other
-        command slot is zero, which is the deployment idle state.
+        Hop intent lives in body_pose[2] per docs/command-block.md. The head
+        slots stay zero, which is the deployment idle state.
+
+        The twist slots carry the hop-cycle phase, NOT a velocity command — see
+        the module docstring. Same cos/sin encoding as
+        ``GroundPickPhaseCommand.compute``, so what the policy reads here is
+        bit-for-bit what it read in training.
         """
         cmd = np.zeros(13, dtype=np.float32)
+        if self.phase_period > 0.0:
+            cmd[0] = math.cos(2.0 * math.pi * self.phase)
+            cmd[1] = math.sin(2.0 * math.pi * self.phase)
         cmd[9] = self.hop_cmd      # 3 twist + 4 head + body[2] -> index 9
         obs = np.concatenate([
             self._sensor(self.gyro) if self.gyro >= 0 else np.zeros(3, np.float32),
@@ -197,6 +280,17 @@ class _Runner:
                 "The 61D contract changed, or this ONNX is from another family."
             )
         return obs
+
+    def head_error_deg(self) -> tuple:
+        """(mean |error| over the 4 neck/head joints, signed pitch error), deg.
+
+        Same quantity head_pose_tracking / head_pose_bias_penalty price in
+        training: joint position minus HOME, against an all-zero commanded head
+        delta. Joints 5-8 in ctrl order are neck_pitch, head_pitch, head_yaw,
+        head_roll (AGENTS.md joint layout).
+        """
+        err = np.degrees(self.data.qpos[self.qpos_idx][5:9] - DEFAULT_POSE[5:9])
+        return float(np.abs(err).mean()), float(err[:2].mean()), err
 
     def n_feet_down(self) -> int:
         down = set()
@@ -224,17 +318,28 @@ class _Runner:
         mujoco.mj_forward(m, d)
         self.last_action[:] = 0.0
 
-        dt = m.opt.timestep * DECIMATION
+        dt = self.dt
         for _ in range(int(settle_s / dt)):
             self._control_step(stand_ctrl_only=True)
+
+        # Training randomizes the phase per env on reset (randomize_phase
+        # defaults True), so every phase is in distribution; drawing from the
+        # episode's seeded rng keeps the battery reproducible while still
+        # sampling the whole cycle across episodes. The clock starts when the
+        # policy takes over, not during the open-loop settle.
+        self.phase = float(rng.random()) if self.phase_period > 0.0 else 0.0
 
         ep = Episode()
         cur_flight = 0.0
         x_takeoff = float(d.qpos[0])
         z_pre = float(d.qpos[2])
         apex = z_pre
+        phase_takeoff = -1.0
+        yaw_at_takeoff = 0.0
         max_tilt_in_flight = 0.0
         streak = 0
+        xy_prev = d.qpos[0:2].copy()
+        yaw_prev = _yaw_deg(d.xquat[self.trunk])
 
         for _ in range(int(duration_s / dt)):
             self._control_step()
@@ -244,10 +349,26 @@ class _Runner:
             z = float(d.qpos[2])
             tilt = _tilt_deg(d.xquat[self.trunk])
 
+            xy = d.qpos[0:2].copy()
+            step_path = float(np.linalg.norm(xy - xy_prev))
+            xy_prev = xy
+            ep.path_m += step_path
+            if n_down == 0:
+                ep.air_path_m += step_path
+            yaw = _yaw_deg(d.xquat[self.trunk])
+            ep.yaw_drift_deg += _wrap_deg(yaw - yaw_prev)
+            yaw_prev = yaw
+            head_abs, head_pitch, head_joints = self.head_error_deg()
+            ep.head_err_deg_sum += head_abs
+            ep.head_pitch_deg_sum += head_pitch
+            ep.head_joint_deg_sum += head_joints
+
             if n_down == 0:
                 if cur_flight == 0.0:
                     x_takeoff, z_pre, apex = float(d.qpos[0]), z, z
                     max_tilt_in_flight = tilt
+                    phase_takeoff = self.phase if self.phase_period > 0.0 else -1.0
+                    yaw_at_takeoff = ep.yaw_drift_deg
                 cur_flight += dt
                 apex = max(apex, z)
                 max_tilt_in_flight = max(max_tilt_in_flight, tilt)
@@ -266,6 +387,8 @@ class _Runner:
                         rise_m=apex - z_pre,
                         land_tilt_deg=tilt,
                         landed_upright=upright,
+                        takeoff_phase=phase_takeoff,
+                        yaw_change_deg=ep.yaw_drift_deg - yaw_at_takeoff,
                     ))
                     streak = streak + 1 if upright else 0
                     ep.max_consecutive = max(ep.max_consecutive, streak)
@@ -281,6 +404,10 @@ class _Runner:
 
     def _control_step(self, stand_ctrl_only: bool = False) -> None:
         if not stand_ctrl_only:
+            # Advance before observing, matching the manager order in training
+            # (commands compute, then observations are gathered).
+            if self.phase_period > 0.0:
+                self.phase = (self.phase + self.dt / self.phase_period) % 1.0
             obs = self.observe()[None, :]
             action = self.session.run(None, {self.input_name: obs})[0][0]
             self.last_action = action.astype(np.float32)
@@ -309,6 +436,17 @@ def main() -> None:
     ap.add_argument("--raw-accel", dest="projected_gravity", action="store_false",
                     default=True,
                     help="policy was trained on raw accelerometer, not projected gravity")
+    # MUST match the twist-slot SEMANTICS the policy was trained with — see the
+    # module docstring. Zeros in a phase carrier are off the unit circle
+    # entirely, a state no training step ever produced, and the harness cannot
+    # detect the mismatch; it just returns a confident wrong verdict.
+    ap.add_argument("--phase-period", type=float, default=PHASE_PERIOD_S,
+                    help="hop-cycle period driven into the twist slots, s "
+                         "(HOP_PERIOD default)")
+    ap.add_argument("--no-phase", dest="phase_period", action="store_const",
+                    const=0.0,
+                    help="twist slots are a VELOCITY command, not a phase clock "
+                         "— for Mjlab-Hop-Flat-MicroDuck and any pre-S5.3 policy")
     ap.add_argument("--kp", type=float, default=20.0,
                     help="position gain override; the MJCF ships kp~0.5 placeholders "
                          "that CANNOT hold STAND (see docs/s1-flight-probe.md)")
@@ -355,10 +493,16 @@ def main() -> None:
         )
 
     session = ort.InferenceSession(str(args.onnx))
-    runner = _Runner(model, data, session, args.hop_cmd, args.projected_gravity)
+    runner = _Runner(model, data, session, args.hop_cmd, args.projected_gravity,
+                     args.phase_period)
 
     print(f"policy {args.onnx.name}  obs {runner.obs_dim}D  "
           f"hop_cmd={args.hop_cmd:.3f}  {args.episodes} episodes x {args.duration:g}s")
+    print("twist slots: " + (
+        f"PHASE CLOCK at {args.phase_period:g} s (S5.3 and later)"
+        if args.phase_period > 0.0
+        else "zero VELOCITY command (--no-phase; pre-S5.3 policies only)")
+        + " — a mismatch here produces a wrong verdict, not an error")
     print(f"kp={args.kp:g} kd={args.kd:g} (MJCF placeholders overridden); "
           f"STAND settles at {settle_tilt:.1f} deg")
     print("NOTE: deployment path — no DR, backlash, obs noise or command delay, "
@@ -372,11 +516,39 @@ def main() -> None:
     fell = sum(e.fell for e in eps)
     consec = max((e.max_consecutive for e in eps), default=0)
 
+    steps = sum(e.steps for e in eps)
+    policy_s = steps * runner.dt
+    path = sum(e.path_m for e in eps)
+    air_path = sum(e.air_path_m for e in eps)
+    air_share = air_path / path if path > 1e-9 else 0.0
+    yaw_per_s = (sum(abs(e.yaw_drift_deg) for e in eps) / policy_s
+                 if policy_s > 0 else 0.0)
+    head_err = sum(e.head_err_deg_sum for e in eps) / max(steps, 1)
+    head_pitch = sum(e.head_pitch_deg_sum for e in eps) / max(steps, 1)
+
     print(f"{'episodes':<28}{len(eps)}")
     print(f"{'  ended fallen':<28}{fell}  ({fell / max(len(eps),1):.0%})")
     print(f"{'genuine hops':<28}{len(hops)}")
     print(f"{'  per episode':<28}{len(hops) / max(len(eps),1):.2f}")
     print(f"{'  best consecutive':<28}{consec}")
+    if args.phase_period > 0.0:
+        cycles = policy_s / args.phase_period
+        print(f"{'  per hop cycle':<28}{len(hops) / max(cycles, 1e-9):.2f}"
+              "   (1.00 = the intended cadence)")
+
+    # "Hopping or scooting?" — the share of horizontal travel that happened
+    # with both feet off the floor. A hop moves the robot through the AIR;
+    # ground travel between hops is scooting, however it is dressed up.
+    print(f"\n{'travel in the air':<28}{air_share:.0%} of "
+          f"{path*1e3:.0f} mm total path")
+    print(f"{'heading drift':<28}{yaw_per_s:+.1f} deg/s "
+          f"(straight-ahead hopping is ~0; nothing prices yaw since S5.3)")
+    head_joints = sum(e.head_joint_deg_sum for e in eps) / max(steps, 1)
+    print(f"{'head error (whole run)':<28}{head_err:.1f} deg mean |err|, "
+          f"pitch {head_pitch:+.1f} deg from HOME")
+    print(f"{'  by joint, signed':<28}" + "  ".join(
+        f"{n} {v:+.1f}" for n, v in
+        zip(("neck_pitch", "head_pitch", "head_yaw", "head_roll"), head_joints)))
 
     if not hops:
         print("\nNo genuine simultaneous flight. Either the policy never leaves "
@@ -400,7 +572,18 @@ def main() -> None:
         line("flight duration", fly, 1e3, "ms")
         line("apex rise", rise, 1e3, "mm")
         line("landing tilt", tilt, 1.0, "deg")
+        line("turn per hop", [abs(h.yaw_change_deg) for h in hops], 1.0, "deg")
         print(f"{'upright landings':<28}{upright_rate:.0%}")
+
+        if args.phase_period > 0.0:
+            # Mean resultant length of the takeoff phases: 1.0 = every hop
+            # leaves the ground at the same point in the cycle (a rhythm),
+            # ~0 = takeoffs are scattered across it (a bounce that ignores the
+            # clock). Circular statistics, because phase wraps at 1.0.
+            ph = np.array([h.takeoff_phase for h in hops])
+            lock = float(abs(np.mean(np.exp(2j * np.pi * ph))))
+            print(f"{'takeoff phase lock':<28}{lock:.2f}   "
+                  f"(1.00 = every hop on the same beat, 0 = ignores the clock)")
 
         print("\n--- S5 decision rule ---")
         print(f"open-loop baseline (free):  {OPEN_LOOP_FORWARD_M*1e3:.0f} mm/hop")
@@ -440,6 +623,12 @@ def main() -> None:
             "median_forward_m": fwd_med,
             "upright_rate": upright_rate,
             "max_consecutive": consec,
+            "phase_period_s": args.phase_period,
+            "air_travel_share": air_share,
+            "path_m": path,
+            "heading_drift_deg_per_s": yaw_per_s,
+            "head_err_deg": head_err,
+            "head_pitch_deg": head_pitch,
             "verdict": verdict,
         }, indent=2))
         print(f"report -> {args.json}")
