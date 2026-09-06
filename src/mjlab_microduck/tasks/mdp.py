@@ -7673,6 +7673,14 @@ def _hop_displacement_state(env: ManagerBasedRlEnv) -> None:
         # that preceded the takeoff — which is what makes "hop, hold a beat, hop
         # again" checkable at the moment the hop is paid.
         env._hop_ground_s = torch.zeros(n, device=env.device)
+        # Vertical shape of the hop (S5.3): the trunk height it left from, the
+        # highest it reached, and the rise banked at the last landing. NOTHING
+        # in the S5.x stack paid for going UP — simultaneous_flight only asks
+        # the trunk to stay above 100 mm — so a 2 mm vibration scored the same
+        # as a real jump, which is why it never looked like a hop.
+        env._hop_takeoff_z = torch.zeros(n, device=env.device)
+        env._hop_apex_z = torch.zeros(n, device=env.device)
+        env._hop_last_rise = torch.zeros(n, device=env.device)
         env._hop_disp_last_step = -1
 
 
@@ -7721,6 +7729,15 @@ def _update_hop_displacement(
 
     asset: Entity = env.scene[asset_cfg.name]
     xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    # Apex tracker: climbs only while airborne, so a robot that is merely tall
+    # cannot bank a rise. Reset to the takeoff height on every grounded step
+    # below, alongside the takeoff pose it belongs with.
+    env._hop_apex_z = torch.where(
+        airborne, torch.maximum(env._hop_apex_z, z), env._hop_apex_z
+    )
 
     # 1. Landing edge, while the latch still holds the takeoff pose.
     zeros = torch.zeros_like(env._hop_last_disp)
@@ -7741,6 +7758,14 @@ def _update_hop_displacement(
         pause = torch.ones_like(banked)
     env._hop_last_disp = torch.where(
         landed_now, torch.where(genuine, banked * pause, zeros), env._hop_last_disp
+    )
+    # Same edge, same gates: bank how high it actually got, measured against the
+    # height it left from rather than absolute z, so a crouch-then-extend is
+    # credited for the whole rise and standing tall earns nothing.
+    env._hop_last_rise = torch.where(
+        landed_now,
+        torch.where(genuine, env._hop_apex_z - env._hop_takeoff_z, zeros),
+        env._hop_last_rise,
     )
 
     # 1b. The payment window is driven by THIS latch, not by re-reading the
@@ -7775,6 +7800,9 @@ def _update_hop_displacement(
     fwd = _heading_xy(asset.data.root_link_quat_w)
     env._hop_takeoff_xy = torch.where(grounded, xy, env._hop_takeoff_xy)
     env._hop_takeoff_fwd = torch.where(grounded, fwd, env._hop_takeoff_fwd)
+    g1 = ~airborne
+    env._hop_takeoff_z = torch.where(g1, z, env._hop_takeoff_z)
+    env._hop_apex_z = torch.where(g1, z, env._hop_apex_z)
     env._hop_was_airborne = airborne
 
     # 3. Freshly reset envs bank nothing from the previous episode.
@@ -7862,6 +7890,101 @@ def hop_displacement(
     landed = env._hop_since_land <= landing_window_s
     settled = env.episode_length_buf > settle_steps
     return progress * (landed & settled & upright).float()
+
+
+def hop_apex_rise(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    rise_target: float = 0.05,
+    min_flight_s: float = 0.02,
+    landing_window_s: float = 0.15,
+    max_tilt_deg: float = 30.0,
+    settle_steps: int = 2,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """How HIGH the hop went, paid at its landing. [0, 1]. Positive weight.
+
+    THE MISSING TERM (S5.3). Through S5, S5.1 and S5.2 nothing in the stack ever
+    paid for the trunk leaving the ground: ``simultaneous_flight`` only requires
+    it to stay ABOVE 100 mm, and ``bilateral_foot_clearance`` scores the FEET,
+    which a tuck satisfies. A 2 mm vibration therefore scored the same as a real
+    jump, and the result reads on video as buzzing rather than hopping.
+
+    Measured as apex MINUS the height it took off from, not absolute height, so
+    the crouch-then-extend countermovement is credited for the full rise it
+    buys, and simply standing tall earns nothing.
+
+    ``rise_target`` is taken from the public record rather than invented: an
+    independent phase-driven hop on this exact robot (upstream PR #28) measured
+    a trunk rise of 0.120 -> 0.187 m, i.e. ~67 mm, over 0.21 s of air. Targeting
+    ~50 mm sits under a figure someone has actually reached on this hardware,
+    which is the difference between a demanding target and an impossible one.
+
+    Capped, and paid once per hop at the landing edge like
+    ``hop_displacement`` — an uncapped height reward is the classic jackpot,
+    and a per-step one is what put the S5 policy in the air 52% of its life.
+    """
+    _update_hop_displacement(env, sensor_name, min_flight_s, asset_cfg)
+    rise = env._hop_last_rise.clamp(min=0.0, max=rise_target) / max(rise_target, 1e-6)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    cos_tilt = torch.nan_to_num(
+        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=-1.0
+    )
+    upright = cos_tilt > math.cos(math.radians(max_tilt_deg))
+
+    landed = env._hop_since_land <= landing_window_s
+    settled = env.episode_length_buf > settle_steps
+    return rise * (landed & settled & upright).float()
+
+
+def hop_crouch_by_phase(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    crouch_z: float = 0.106,
+    stand_z: float = 0.1167,
+    std: float = 0.012,
+    phase_lo: float = 0.10,
+    phase_hi: float = 0.30,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward loading the legs — trunk down at ``crouch_z`` — inside the crouch
+    window of the hop phase. [0, 1]. Positive weight.
+
+    The other half of "make it look like a hop" (S5.3). A hop reads as a hop
+    because of the COUNTERMOVEMENT: load, then extend. Both independent hops on
+    this robot shape it explicitly — the community episodic policy describes
+    "crouch through the hips and knees, extend for takeoff", and upstream PR #28
+    rewards a crouch to trunk z 0.106 m in phase window 0.10-0.30. We rewarded
+    neither and hoped it would emerge from a travel reward. It did not.
+
+    Deliberately a WINDOWED reward, not a tracked trajectory: it says "be low
+    HERE", and leaves how to get low, and the entire launch and flight, to the
+    policy. CLAUDE.md is explicit that keyframe/waypoint trajectories make the
+    policy camp at waypoints and that the path is what RL should discover.
+
+    Phase comes from the same ``GroundPickPhaseCommand`` cos/sin encoding the
+    ground-pick and sit-stand tasks use, so nothing new had to be invented for
+    the cycle — and the phase clock is ALSO what delivers the requested "hop,
+    stay in place for a sec, hop again" rhythm as structure rather than as
+    something the policy must stumble into.
+
+    ``crouch_z`` must sit BELOW the settled standing height or this rewards
+    standing; a test pins that.
+    """
+    phase = _gp_phase(env, command_name)
+    in_window = (phase >= phase_lo) & (phase < phase_hi)
+
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    # One-sided: being LOWER than the target is not penalised back toward it
+    # (a deeper load is fine and may be better), but being high scores nothing.
+    err = (z - crouch_z).clamp(min=0.0)
+    del stand_z  # kept in the signature for cfg readability / assertions
+    return torch.exp(-((err / std) ** 2)) * in_window.float()
 
 
 def hop_settle(

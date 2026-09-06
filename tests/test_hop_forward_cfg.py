@@ -15,12 +15,15 @@ from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_hop_env_cfg import (
     CLEARANCE_WEIGHT_FORWARD,
     DISP_HANDOVER_ITER,
-    FLIGHT_WEIGHT_AFTER_HANDOVER,
+    FLIGHT_WEIGHT_S53,
     FORWARD_VEL_CAP,
     HOP_DISP_CAP,
     HOP_DISP_WEIGHT,
     HOP_HEAD_TRACK_WEIGHT,
+    HOP_APEX_TARGET,
     HOP_MIN_GROUND_S,
+    HOP_MIN_GROUND_S_S53,
+    HOP_PERIOD,
     HOP_SETTLE_WEIGHT,
     HOP_SETTLE_WINDOW_S,
     HOP_TRACK_LIN_VEL_WEIGHT,
@@ -105,17 +108,22 @@ def test_displacement_is_the_dominant_term_after_the_handover():
     assert disp > max(others.values()), others
 
 
-def test_flight_demotes_but_stays_above_the_clearance_ramp():
-    # Flight is a MEANS now, not the goal — but it must not fall below the ramp
-    # that exists to bootstrap it, or a deep two-foot tuck outranks leaving the
-    # ground at all.
+def test_flight_becomes_instrumental_not_an_objective():
+    # S5.3. Paying per airborne step is DOUBLE-paying once displacement and apex
+    # both require flight to collect — and it is the measured bounce engine: at
+    # weight 2.0 the S5.2 policy lived 53% of its life in the air. It is not
+    # zeroed, because a residual signal for leaving the ground is still the
+    # cheapest bootstrap, but it must no longer outrank anything real.
     cfg = make_microduck_hop_env_cfg(forward=True)
     base = make_microduck_hop_env_cfg()
     flight = _final_weight(cfg, "simultaneous_flight")
-    clearance = _final_weight(cfg, "bilateral_foot_clearance")
-    assert flight == FLIGHT_WEIGHT_AFTER_HANDOVER
-    assert flight < base.rewards["simultaneous_flight"].weight
-    assert 0.0 < clearance == CLEARANCE_WEIGHT_FORWARD < flight
+    assert flight == FLIGHT_WEIGHT_S53
+    assert 0.0 < flight < base.rewards["simultaneous_flight"].weight
+    for goal in ("hop_displacement", "hop_apex_rise"):
+        assert flight < _final_weight(cfg, goal), goal
+    # The clearance ramp may now sit ABOVE it — that is intended, not drift:
+    # clearance shapes the lift, flight merely observes it.
+    assert _final_weight(cfg, "bilateral_foot_clearance") == CLEARANCE_WEIGHT_FORWARD
 
 
 def test_the_handover_is_phase_aligned_not_a_swap():
@@ -167,16 +175,38 @@ def test_the_hop_rhythm_is_encoded_not_hoped_for():
     # maneuver in state-based structure, not in small nudges.
     cfg = make_microduck_hop_env_cfg(forward=True)
     disp = cfg.rewards["hop_displacement"].params
-    settle = cfg.rewards["hop_settle"].params
-    # A hop is only paid in full if a pause preceded it...
-    assert disp["min_ground_s"] == HOP_MIN_GROUND_S > 0.0
-    # ...and the pause itself is worth something, so there is a gradient toward
-    # it rather than only a penalty for skipping it.
+    # S5.3: the RHYTHM now comes from a phase clock, which is structure rather
+    # than something the policy has to stumble into. S5.2 proved the latter
+    # fails — demanding a 0.5 s pause from step 0 just silenced the term
+    # (hop_settle earned ~0 and displacement collapsed 7x).
+    twist = cfg.commands["twist"]
+    assert isinstance(twist, microduck_mdp.GroundPickPhaseCommandCfg)
+    assert twist.period == HOP_PERIOD > 0.0
+    # The pause factor stays only as a backstop, well below the old demand, so
+    # it cannot silence the travel term again.
+    assert 0.0 < disp["min_ground_s"] == HOP_MIN_GROUND_S_S53 < HOP_MIN_GROUND_S
+    # The hold is still paid for directly.
     assert cfg.rewards["hop_settle"].func is microduck_mdp.hop_settle
     assert cfg.rewards["hop_settle"].weight == HOP_SETTLE_WEIGHT > 0.0
-    # The hold pays out exactly as long as it takes to qualify for the next
-    # full-price hop: standing longer earns nothing, hopping does.
-    assert settle["settle_window_s"] == HOP_SETTLE_WINDOW_S == HOP_MIN_GROUND_S
+
+
+def test_the_hop_has_a_crouch_and_a_rise_which_is_what_makes_it_look_like_one():
+    # S5.3, and the whole point of it. Nothing in S5/S5.1/S5.2 ever paid for the
+    # trunk going UP or for loading the legs first, so a 2 mm vibration scored
+    # like a jump. BOTH independent working hops on this robot shape both.
+    cfg = make_microduck_hop_env_cfg(forward=True)
+    crouch = cfg.rewards["hop_crouch"]
+    apex = cfg.rewards["hop_apex_rise"]
+    assert crouch.func is microduck_mdp.hop_crouch_by_phase
+    assert apex.func is microduck_mdp.hop_apex_rise
+    # The crouch target must be BELOW the settled standing height, or this pays
+    # for standing.
+    assert crouch.params["crouch_z"] < crouch.params["stand_z"]
+    # And it fires in the loading window, before the launch.
+    assert 0.0 <= crouch.params["phase_lo"] < crouch.params["phase_hi"] < 0.5
+    # The rise target sits under the 67 mm an independent phase-driven hop
+    # actually measured on this robot: demanding, not impossible.
+    assert 0.0 < apex.params["rise_target"] == HOP_APEX_TARGET < 0.067
 
 
 def test_holding_still_never_outearns_hopping():
@@ -254,22 +284,31 @@ def test_head_pose_bias_returns_at_walker_strength_for_forward_only():
     assert [s["weight"] for s in stages] == sorted(s["weight"] for s in stages)
 
 
-def test_velocity_tracking_is_demoted_but_alive():
-    # THE fix that makes E1 reachable. At the walker's 2.0 / std sqrt(0.1),
-    # tracking a near-zero command costs a 0.4 m/s hop ~1.6 reward/step, which
-    # out-masses any forward term the dominance invariant permits.
+def test_velocity_terms_are_deleted_once_twist_carries_the_phase():
+    # MANDATORY, and the way this env can break most quietly. Under S5.3 the
+    # twist slot carries [cos(2*pi*phase), sin(2*pi*phase), 0]. Any term that
+    # reads that slot as a VELOCITY command is then paying the policy to track a
+    # cosine as a target speed. ground_pick deletes exactly these three for
+    # exactly this reason.
     hop = make_microduck_hop_env_cfg(forward=True)
+    for name in ("track_linear_velocity", "track_angular_velocity", "air_time"):
+        assert name not in hop.rewards, name
+    # The baseline hop-in-place env still has a real velocity command, so it
+    # must KEEP them — this is the A/B reference.
+    base = make_microduck_hop_env_cfg()
+    for name in ("track_linear_velocity", "air_time"):
+        assert name in base.rewards, name
+    assert base.rewards["track_linear_velocity"].weight > 0.0
+
+
+def test_the_baseline_keeps_the_demoted_tracking_weight():
+    # S5's "least obvious line": the walker's 2.0 tracking term makes hopping
+    # forward COST ~1.6 reward/step against a forward term capped at 1.5, so E1
+    # loses before it starts unless tracking steps back. The forward variant now
+    # deletes the term outright, but the constant still documents the finding
+    # and the baseline still demonstrates the demotion.
     vel = make_microduck_velocity_env_cfg()
-    w = hop.rewards["track_linear_velocity"].weight
-    assert w == HOP_TRACK_LIN_VEL_WEIGHT
-    assert w < vel.rewards["track_linear_velocity"].weight
-    # Not zeroed: it still discourages aimless drift.
-    assert w > 0.0
-    # And the demotion must actually beat the forward term it was blocking.
-    fwd = hop.rewards["forward_flight_progress"].weight
-    cost_of_hopping = vel.rewards["track_linear_velocity"].params["std"]
-    assert cost_of_hopping is not None  # std present, so the arithmetic holds
-    assert fwd > w
+    assert 0.0 < HOP_TRACK_LIN_VEL_WEIGHT < vel.rewards["track_linear_velocity"].weight
 
 
 def test_impact_penalty_self_negates_so_its_weight_is_positive():

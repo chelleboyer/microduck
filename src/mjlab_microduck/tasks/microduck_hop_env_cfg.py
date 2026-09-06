@@ -175,7 +175,7 @@ WITHOUT BAM back-EMF, so the realistic no-learning figure is lower.
 """
 
 import math
-from dataclasses import replace
+from dataclasses import fields, replace
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers import CurriculumTermCfg, RewardTermCfg
@@ -300,6 +300,44 @@ HOP_SETTLE_WINDOW_S = 0.5
 # not a hold.
 HOP_SETTLE_MAX_SPEED = 0.15
 HOP_SETTLE_WEIGHT = 1.5
+
+# ── S5.3: make it LOOK like a hop — phase cycle, crouch, apex ─────────────────
+# S5.2 fixed the head and failed the rhythm: hop_settle earned ~0, the policy was
+# airborne 53% of its life, and displacement collapsed 7x because the 0.5 s pause
+# it demanded from step 0 was a requirement the current behaviour could not meet.
+# The user's verdict on the video was blunter and more useful: "he isn't really
+# doing a hopscotch hop at all".
+#
+# The survey of what everyone else does explains why. TWO independent working
+# hops exist on this exact robot, and BOTH explicitly shape a crouch and a
+# vertical rise:
+#   - joanfox/microduck-happy-hop (episodic, hardware-tested 2026-09-01):
+#     "stabilize, crouch through the hips and knees, extend for takeoff, absorb
+#     the landing with knee flexion, return toward HOME".
+#   - upstream PR #28 (open, phase-driven periodic): a reward LADDER of
+#     crouch (phase 0.10-0.30, trunk z -> 0.106) / launch (0.28-0.38, vz) /
+#     airtime, reporting 256/256 envs achieving liftoff and a trunk rise of
+#     0.120 -> 0.187 m (67 mm) over 0.21 s of air, in 600 iterations.
+# We shaped NEITHER, and hoped the countermovement would emerge from a travel
+# reward. It did not. Nothing in the S5.x stack ever paid for going UP.
+#
+# So S5.3 takes the structure the field converged on and keeps the parts of ours
+# that are ahead of it (displacement paid at landing; landing quality; the head).
+HOP_PERIOD = 1.6          # s per hop cycle: crouch, launch, fly, land, HOLD
+HOP_CROUCH_PHASE = (0.10, 0.30)   # matches PR #28's window
+HOP_CROUCH_Z = 0.106      # PR #28's measured crouch target, m
+HOP_CROUCH_WEIGHT = 3.0
+# Under PR #28's measured 67 mm so the target is demanding, not impossible.
+HOP_APEX_TARGET = 0.05
+HOP_APEX_WEIGHT = 6.0
+# The phase clock now provides the pause, so the displacement term stops
+# policing it. S5.2 proved a 0.5 s requirement imposed from step 0 just silences
+# the term; a short backstop is enough to keep a bounce from banking travel.
+HOP_MIN_GROUND_S_S53 = 0.15
+# Flight is now purely instrumental — displacement and apex both REQUIRE it, so
+# paying per airborne step on top is double-paying, and it is the measured
+# bounce engine (53% of life in the air at weight 2.0).
+FLIGHT_WEIGHT_S53 = 0.25
 
 
 def make_microduck_hop_env_cfg(
@@ -471,6 +509,60 @@ def make_microduck_hop_env_cfg(
         # std — the std is what stopped the walker moving).
         cfg.rewards["head_pose_tracking"].weight = HOP_HEAD_TRACK_WEIGHT
 
+        # ── S5.3: the phase cycle, the crouch, and the rise ──────────────────
+        # The twist slot becomes a cyclic phase carrier, exactly as ground_pick
+        # and sitstand already do — same 3 command slots, different semantics,
+        # so the 61D contract is untouched.
+        # Copy only the fields the phase cfg actually declares: the velocity env's
+        # twist cfg is a microduck SUBCLASS carrying extras (rel_turn_in_place_envs)
+        # that UniformVelocityCommandCfg — and so GroundPickPhaseCommandCfg —
+        # does not have, and an unfiltered vars() spread dies on them.
+        twist_cfg = cfg.commands["twist"]
+        _allowed = {f.name for f in fields(microduck_mdp.GroundPickPhaseCommandCfg)}
+        cfg.commands["twist"] = microduck_mdp.GroundPickPhaseCommandCfg(
+            **{
+                **{k: v for k, v in vars(twist_cfg).items() if k in _allowed},
+                "class_type": microduck_mdp.GroundPickPhaseCommand,
+                "period": HOP_PERIOD,
+            }
+        )
+
+        # MANDATORY with a phase carrier: these terms read the twist slot as a
+        # VELOCITY command. Left in, the policy is paid for matching cos(2*pi*t)
+        # as a target speed, which is nonsense. ground_pick deletes exactly
+        # these for exactly this reason.
+        for name in ("track_linear_velocity", "track_angular_velocity", "air_time"):
+            cfg.rewards.pop(name, None)
+
+        cfg.rewards["hop_crouch"] = RewardTermCfg(
+            func=microduck_mdp.hop_crouch_by_phase,
+            weight=HOP_CROUCH_WEIGHT,
+            params={
+                "command_name": "twist",
+                "crouch_z": HOP_CROUCH_Z,
+                "stand_z": LANDING_TARGET_Z,
+                "phase_lo": HOP_CROUCH_PHASE[0],
+                "phase_hi": HOP_CROUCH_PHASE[1],
+            },
+        )
+
+        # THE term that should make it read as a hop rather than a buzz.
+        cfg.rewards["hop_apex_rise"] = RewardTermCfg(
+            func=microduck_mdp.hop_apex_rise,
+            weight=HOP_APEX_WEIGHT,
+            params={
+                "sensor_name": "feet_ground_contact",
+                "rise_target": HOP_APEX_TARGET,
+                "min_flight_s": FLIGHT_MIN_S,
+                "landing_window_s": LANDING_WINDOW_S,
+                "max_tilt_deg": FLIGHT_MAX_TILT_DEG,
+            },
+        )
+
+        # The phase clock now owns the rhythm; the pause factor steps back to a
+        # backstop so it cannot silence the travel term the way S5.2's did.
+        cfg.rewards["hop_displacement"].params["min_ground_s"] = HOP_MIN_GROUND_S_S53
+
     # ── Curricula ─────────────────────────────────────────────────────────────
     # The velocity env ramps head_pose_bias from iter 600. Drop it: it is a
     # posture-precision tax on the head, and the head is a load-bearing part of
@@ -515,9 +607,12 @@ def make_microduck_hop_env_cfg(
                 "reward_name": "simultaneous_flight",
                 "weight_stages": [
                     {"step": 0, "weight": 5.0},
-                    {"step": DISP_HANDOVER_ITER * NUM_STEPS_PER_ENV, "weight": 3.0},
+                    {"step": DISP_HANDOVER_ITER * NUM_STEPS_PER_ENV, "weight": 1.0},
+                    # S5.3: flight is instrumental — displacement and apex both
+                    # REQUIRE it, so paying per airborne step is double-paying,
+                    # and it is the measured bounce engine.
                     {"step": 2 * DISP_HANDOVER_ITER * NUM_STEPS_PER_ENV,
-                     "weight": FLIGHT_WEIGHT_AFTER_HANDOVER},
+                     "weight": FLIGHT_WEIGHT_S53},
                 ],
             },
         )

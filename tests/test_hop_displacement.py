@@ -54,9 +54,15 @@ class _Asset:
         self.data = _AssetData(n)
 
 
+class _Terrain:
+    def __init__(self, n):
+        self.env_origins = torch.zeros(n, 3)
+
+
 class _Scene:
     def __init__(self, n):
         self._items = {"contact": _Sensor(n), "robot": _Asset(n)}
+        self.terrain = _Terrain(n)
 
     def __getitem__(self, key):
         return self._items[key]
