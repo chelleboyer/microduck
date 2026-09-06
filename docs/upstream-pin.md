@@ -8,10 +8,15 @@
 |---|---|
 | Upstream | [`pollen-robotics/microduck_rl`](https://github.com/pollen-robotics/microduck_rl) (Apache 2.0) |
 | Remote | `upstream` |
-| Pinned commit | `1e79c29c97d8b38aee9eefde77a545860ba7658e` |
-| Date | 2026-08-25 |
-| Subject | *license section: hardware design files are CC BY-SA-NC (same wording as reachy_mini)* |
-| Merged into | `develop` on 2026-09-04, via `git merge --allow-unrelated-histories` |
+| Pinned commit | `29e887ecfbf5d37144759e5a9f8a176dfb83d547` |
+| Date | 2026-09-02 |
+| Subject | *Merge pull request #30 from peterschade/sim-body-server* |
+| Merged into | `develop` on 2026-09-04 (`--allow-unrelated-histories`); re-pulled 2026-09-05 from `upstream/develop` (44 commits) |
+
+> **NOTE the branch.** Upstream's default branch is `develop`, NOT `main` — `upstream/HEAD` points
+> there and `main` has not moved since the original fork. A `git log 1e79c29..upstream/main` reports
+> ZERO new commits and looks like "nothing to pull", while `develop` was 44 ahead. Always compare
+> against `upstream/develop`.
 
 ## Why this commit
 
